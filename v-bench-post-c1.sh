@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 "${PYTHON:-python3}" - <<'PY'
-import json, os, shlex, shutil, statistics, subprocess, sys, zipfile
+import json, os, shlex, shutil, statistics, subprocess, sys, urllib.request, zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -47,8 +47,53 @@ def run(cmd):
         sys.exit(f"vllm failed: {shlex.join(cmd)}\n{result.stderr[-2000:]}")
 
 
-def ttft(path):
-    return float(json.loads(Path(path).read_text(encoding="utf-8"))["ttfts"][0])
+def result_info(path):
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    ok = int(data.get("completed", 1))
+    failed = int(data.get("failed", 0))
+    return float(data["ttfts"][0]), ok, failed
+
+
+def metric_sum(text, name):
+    total = 0.0
+    found = False
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0].split("{", 1)[0] == name:
+            try:
+                total += float(fields[1])
+                found = True
+            except ValueError:
+                pass
+    return total if found else None
+
+
+def prefix_metrics():
+    try:
+        text = urllib.request.urlopen(
+            f"http://{HOST}:{PORT}/metrics", timeout=2
+        ).read().decode()
+    except Exception:
+        return None
+    for query_name, hit_name in (
+        ("vllm:prefix_cache_queries_total", "vllm:prefix_cache_hits_total"),
+        ("vllm:gpu_prefix_cache_queries_total", "vllm:gpu_prefix_cache_hits_total"),
+    ):
+        queries = metric_sum(text, query_name)
+        hits = metric_sum(text, hit_name)
+        if queries is not None and hits is not None:
+            return queries, hits
+    return None
+
+
+def hit_rate(before, after):
+    if before is None or after is None:
+        return None
+    queries = after[0] - before[0]
+    hits = after[1] - before[1]
+    if queries <= 0:
+        return None
+    return hits / queries
 
 
 def col_name(index):
@@ -101,16 +146,30 @@ run_dir = OUTPUT_DIR / datetime.now(timezone(timedelta(hours=8))).strftime("%H%M
 json_dir = run_dir / "json"
 json_dir.mkdir(parents=True, exist_ok=True)
 vllm_bin = vllm()
-print("Cache warmup request")
+before = prefix_metrics()
 run(command(vllm_bin, json_dir, "warmup.json"))
-ttft(json_dir / "warmup.json")
+_, ok, failed = result_info(json_dir / "warmup.json")
+after = prefix_metrics()
+rate = hit_rate(before, after)
+warmup_rate = f"{rate:.2%}" if rate is not None else "N/A"
+print(
+    f"Cache warmup request: success={ok}/{ok + failed}, "
+    f"Prefix hit rate={warmup_rate}"
+)
 values = []
 for batch in range(1, BATCHES + 1):
     filename = f"concurrency-001-batch-{batch:02d}.json"
+    before = prefix_metrics()
     run(command(vllm_bin, json_dir, filename))
-    value = ttft(json_dir / filename)
+    value, ok, failed = result_info(json_dir / filename)
+    after = prefix_metrics()
+    rate = hit_rate(before, after)
+    batch_rate = f"{rate:.2%}" if rate is not None else "N/A"
     values.append(value)
-    print(f"  Batch {batch}/{BATCHES}: Avg TTFT={value:.6f}s")
+    print(
+        f"  Batch {batch}/{BATCHES}: Avg TTFT={value:.6f}s, "
+        f"success={ok}/{ok + failed}, Prefix hit rate={batch_rate}"
+    )
 raw_rows = [["concurrency", "batch", "ttft_seconds"]]
 raw_rows.extend([1, batch, value] for batch, value in enumerate(values, start=1))
 summary_rows = [
