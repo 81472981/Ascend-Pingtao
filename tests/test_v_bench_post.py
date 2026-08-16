@@ -13,6 +13,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "v-bench-post.py"
+C1_SCRIPT = REPO_ROOT / "v-bench-post-c1.py"
 FAKE_VLLM = REPO_ROOT / "tests" / "fake_vllm.py"
 
 
@@ -173,6 +174,49 @@ class VBencPostTest(unittest.TestCase):
             self.assertEqual(failed, 1)
             self.assertEqual([record.ttft_seconds for record in records], [0.010, 0.030])
             self.assertEqual([record.request_index for record in records], [1, 3])
+
+    def test_c1_script_with_fake_vllm(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "results"
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(C1_SCRIPT),
+                    "--vllm-bin",
+                    f"{sys.executable} {FAKE_VLLM}",
+                    "--output-dir",
+                    str(output_dir),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+
+            run_dir = next(output_dir.iterdir())
+            with (run_dir / "raw_ttft.csv").open(
+                encoding="utf-8-sig", newline=""
+            ) as raw_file:
+                raw_rows = list(csv.DictReader(raw_file))
+            self.assertEqual(len(raw_rows), 5)
+            self.assertEqual(
+                {int(row["concurrency"]) for row in raw_rows},
+                {1},
+            )
+
+            with (run_dir / "summary_ttft.csv").open(
+                encoding="utf-8-sig", newline=""
+            ) as summary_file:
+                summary_row = next(csv.DictReader(summary_file))
+            self.assertAlmostEqual(
+                float(summary_row["mean_ttft_seconds"]),
+                0.013,
+                places=9,
+            )
 
 
 if __name__ == "__main__":
