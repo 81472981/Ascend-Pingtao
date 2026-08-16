@@ -8,7 +8,7 @@ import statistics
 import subprocess
 import sys
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -153,7 +153,7 @@ def write_xlsx(path, sheets):
             archive.writestr(f"xl/worksheets/sheet{index}.xml", sheet_xml(rows))
 
 
-run_dir = OUTPUT_DIR / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+run_dir = OUTPUT_DIR / datetime.now(timezone(timedelta(hours=8))).strftime("%H%M%S")
 json_dir = run_dir / "json"
 json_dir.mkdir(parents=True, exist_ok=True)
 vllm_bin = vllm()
