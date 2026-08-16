@@ -68,10 +68,44 @@ def metric_sum(text, name):
     return total if found else None
 
 
+def metric_names(text):
+    names = []
+    for line in text.splitlines():
+        if line and not line.startswith("#"):
+            fields = line.split()
+            if fields:
+                names.append(fields[0].split("{", 1)[0])
+    return names
+
+
+def find_tier_pair(names, tier):
+    keywords = {
+        "HBM": ("gpu_prefix_cache", "hbm"),
+        "DRAM": ("cpu_prefix_cache", "dram"),
+        "SSD": ("disk_prefix_cache", "ssd"),
+    }[tier]
+    query_names = []
+    hit_names = []
+    for name in names:
+        if "prefix_cache" not in name or not any(key in name for key in keywords):
+            continue
+        if "queries" in name:
+            query_names.append(name)
+        elif "hits" in name:
+            hit_names.append(name)
+    for query_name in query_names:
+        hit_name = query_name.replace("queries", "hits")
+        if hit_name in hit_names:
+            return query_name, hit_name
+    return None
+
+
 TIER_PAIRS = {
     "HBM": (
         ("vllm:gpu_prefix_cache_queries_total", "vllm:gpu_prefix_cache_hits_total"),
         ("vllm:gpu_prefix_cache_queries", "vllm:gpu_prefix_cache_hits"),
+        ("vllm:prefix_cache_queries_total", "vllm:prefix_cache_hits_total"),
+        ("vllm:prefix_cache_queries", "vllm:prefix_cache_hits"),
     ),
     "DRAM": (
         ("vllm:cpu_prefix_cache_queries_total", "vllm:cpu_prefix_cache_hits_total"),
@@ -91,9 +125,18 @@ def tier_metrics():
         ).read().decode()
     except Exception:
         return {tier: None for tier in TIER_PAIRS}
+    names = metric_names(text)
     result = {}
     for tier, pairs in TIER_PAIRS.items():
         result[tier] = None
+        dynamic_pair = find_tier_pair(names, tier)
+        if dynamic_pair is not None:
+            query_name, hit_name = dynamic_pair
+            queries = metric_sum(text, query_name)
+            hits = metric_sum(text, hit_name)
+            if queries is not None and hits is not None:
+                result[tier] = (queries, hits)
+                continue
         for query_name, hit_name in pairs:
             queries = metric_sum(text, query_name)
             hits = metric_sum(text, hit_name)
