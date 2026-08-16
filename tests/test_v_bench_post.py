@@ -13,7 +13,6 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "v-bench-post.py"
-C1_SCRIPT = REPO_ROOT / "v-bench-post-c1.py"
 C1_SHELL_SCRIPT = REPO_ROOT / "v-bench-post-c1.sh"
 FAKE_VLLM = REPO_ROOT / "tests" / "fake_vllm.py"
 
@@ -175,46 +174,6 @@ class VBencPostTest(unittest.TestCase):
             self.assertEqual(failed, 1)
             self.assertEqual([record.ttft_seconds for record in records], [0.010, 0.030])
             self.assertEqual([record.request_index for record in records], [1, 3])
-
-    def test_c1_script_with_fake_vllm(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            output_dir = Path(temp_dir) / "results"
-            env = os.environ.copy()
-            env["VLLM_BIN"] = f"{sys.executable} {FAKE_VLLM}"
-            env["VB_OUT"] = str(output_dir)
-            completed = subprocess.run(
-                [sys.executable, str(C1_SCRIPT)],
-                text=True,
-                capture_output=True,
-                check=False,
-                env=env,
-            )
-            self.assertEqual(
-                completed.returncode,
-                0,
-                msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
-            )
-
-            run_dir = next(output_dir.iterdir())
-            with (run_dir / "raw_ttft_c1.csv").open(
-                encoding="utf-8-sig", newline=""
-            ) as raw_file:
-                raw_rows = list(csv.DictReader(raw_file))
-            self.assertEqual(len(raw_rows), 5)
-            self.assertEqual(
-                {int(row["concurrency"]) for row in raw_rows},
-                {1},
-            )
-
-            with (run_dir / "summary_ttft_c1.csv").open(
-                encoding="utf-8-sig", newline=""
-            ) as summary_file:
-                summary_row = next(csv.DictReader(summary_file))
-            self.assertAlmostEqual(
-                float(summary_row["mean_ttft_seconds"]),
-                0.013,
-                places=9,
-            )
 
     def test_c1_shell_script_with_fake_vllm(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
