@@ -101,7 +101,7 @@ run_dir = OUTPUT_DIR / datetime.now(timezone(timedelta(hours=8))).strftime("%H%M
 json_dir = run_dir / "json"
 json_dir.mkdir(parents=True, exist_ok=True)
 vllm_bin = vllm()
-print("Cold start request")
+print("Cache warmup request")
 run(command(vllm_bin, json_dir, "warmup.json"))
 ttft(json_dir / "warmup.json")
 values = []
