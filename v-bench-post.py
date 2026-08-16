@@ -516,7 +516,7 @@ def main() -> None:
     concurrencies = parse_concurrencies(args.concurrencies)
     command_prefix = resolve_command_prefix(args.vllm_bin)
     output_root = args.output_dir.expanduser().resolve()
-    run_dir = output_root / datetime.now(timezone(timedelta(hours=8))).strftime("%H%M%S")
+    run_dir = output_root / datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d-%H%M%S")
     json_dir = run_dir / "json"
     json_dir.mkdir(parents=True, exist_ok=True)
 

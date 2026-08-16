@@ -173,7 +173,7 @@ def write_xlsx(path, sheets):
             z.writestr(f"xl/worksheets/sheet{index}.xml", sheet_xml(rows))
 
 
-run_dir = OUTPUT_DIR / datetime.now(timezone(timedelta(hours=8))).strftime("%H%M%S")
+run_dir = OUTPUT_DIR / datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d-%H%M%S")
 json_dir = run_dir / "json"
 json_dir.mkdir(parents=True, exist_ok=True)
 vllm_bin = vllm()
