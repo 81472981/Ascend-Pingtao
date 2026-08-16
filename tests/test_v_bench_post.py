@@ -178,18 +178,15 @@ class VBencPostTest(unittest.TestCase):
     def test_c1_script_with_fake_vllm(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir) / "results"
+            env = os.environ.copy()
+            env["VLLM_BIN"] = f"{sys.executable} {FAKE_VLLM}"
+            env["VB_OUT"] = str(output_dir)
             completed = subprocess.run(
-                [
-                    sys.executable,
-                    str(C1_SCRIPT),
-                    "--vllm-bin",
-                    f"{sys.executable} {FAKE_VLLM}",
-                    "--output-dir",
-                    str(output_dir),
-                ],
+                [sys.executable, str(C1_SCRIPT)],
                 text=True,
                 capture_output=True,
                 check=False,
+                env=env,
             )
             self.assertEqual(
                 completed.returncode,
