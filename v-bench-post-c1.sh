@@ -158,11 +158,10 @@ json_dir = run_dir / "json"
 json_dir.mkdir(parents=True, exist_ok=True)
 vllm_bin = vllm()
 
-print("[1/2] Warming prefix cache with 1 request")
+print("Cold start request")
 run(command(vllm_bin, json_dir, "warmup.json"))
 ttft(json_dir / "warmup.json")
 
-print("[2/2] Running 5 batches at concurrency=1")
 values = []
 for batch in range(1, BATCHES + 1):
     filename = f"concurrency-001-batch-{batch:02d}.json"
@@ -181,7 +180,4 @@ summary_rows = [
 
 result_path = run_dir / "result_c1.xlsx"
 write_xlsx(result_path, {"raw": raw_rows, "summary": summary_rows})
-
-print(f"Mean TTFT: {statistics.fmean(values):.6f}s")
-print(f"Result:     {result_path}")
 PY
