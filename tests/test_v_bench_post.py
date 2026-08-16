@@ -207,9 +207,8 @@ class VBencPostTest(unittest.TestCase):
                 self.assertIn("ttft_seconds", raw_xml)
                 self.assertIn("Avg TTFT", summary_xml)
                 self.assertIn("Success", summary_xml)
-                self.assertIn("Prefix hit rate-HBM", summary_xml)
-                self.assertIn("Prefix hit rate-DRAM", summary_xml)
-                self.assertIn("Prefix hit rate-SSD", summary_xml)
+                self.assertIn("prefix_cache", summary_xml)
+                self.assertIn("external_prefix_cache", summary_xml)
                 self.assertIn("0.013", summary_xml)
 
 

@@ -68,93 +68,46 @@ def metric_sum(text, name):
     return total if found else None
 
 
-def metric_names(text):
-    names = []
-    for line in text.splitlines():
-        if line and not line.startswith("#"):
-            fields = line.split()
-            if fields:
-                names.append(fields[0].split("{", 1)[0])
-    return names
-
-
-def find_tier_pair(names, tier):
-    keywords = {
-        "HBM": ("gpu_prefix_cache", "hbm"),
-        "DRAM": ("cpu_prefix_cache", "dram"),
-        "SSD": ("disk_prefix_cache", "ssd"),
-    }[tier]
-    query_names = []
-    hit_names = []
-    for name in names:
-        if "prefix_cache" not in name or not any(key in name for key in keywords):
-            continue
-        if "queries" in name:
-            query_names.append(name)
-        elif "hits" in name:
-            hit_names.append(name)
-    for query_name in query_names:
-        hit_name = query_name.replace("queries", "hits")
-        if hit_name in hit_names:
-            return query_name, hit_name
-    return None
-
-
-TIER_PAIRS = {
-    "HBM": (
-        ("vllm:gpu_prefix_cache_queries_total", "vllm:gpu_prefix_cache_hits_total"),
-        ("vllm:gpu_prefix_cache_queries", "vllm:gpu_prefix_cache_hits"),
+CACHE_PAIRS = {
+    "prefix_cache": (
         ("vllm:prefix_cache_queries_total", "vllm:prefix_cache_hits_total"),
         ("vllm:prefix_cache_queries", "vllm:prefix_cache_hits"),
     ),
-    "DRAM": (
-        ("vllm:cpu_prefix_cache_queries_total", "vllm:cpu_prefix_cache_hits_total"),
-        ("vllm:cpu_prefix_cache_queries", "vllm:cpu_prefix_cache_hits"),
-    ),
-    "SSD": (
-        ("vllm:disk_prefix_cache_queries_total", "vllm:disk_prefix_cache_hits_total"),
-        ("vllm:disk_prefix_cache_queries", "vllm:disk_prefix_cache_hits"),
+    "external_prefix_cache": (
+        ("vllm:external_prefix_cache_queries_total", "vllm:external_prefix_cache_hits_total"),
+        ("vllm:external_prefix_cache_queries", "vllm:external_prefix_cache_hits"),
     ),
 }
 
 
-def tier_metrics():
+def cache_metrics():
     try:
         text = urllib.request.urlopen(
             f"http://{HOST}:{PORT}/metrics", timeout=2
         ).read().decode()
     except Exception:
-        return {tier: None for tier in TIER_PAIRS}
-    names = metric_names(text)
+        return {name: None for name in CACHE_PAIRS}
     result = {}
-    for tier, pairs in TIER_PAIRS.items():
-        result[tier] = None
-        dynamic_pair = find_tier_pair(names, tier)
-        if dynamic_pair is not None:
-            query_name, hit_name = dynamic_pair
-            queries = metric_sum(text, query_name)
-            hits = metric_sum(text, hit_name)
-            if queries is not None and hits is not None:
-                result[tier] = (queries, hits)
-                continue
+    for name, pairs in CACHE_PAIRS.items():
+        result[name] = None
         for query_name, hit_name in pairs:
             queries = metric_sum(text, query_name)
             hits = metric_sum(text, hit_name)
             if queries is not None and hits is not None:
-                result[tier] = (queries, hits)
+                result[name] = (queries, hits)
                 break
     return result
 
 
-def tier_rates(before, after):
+def cache_rates(before, after):
     rates = {}
-    for tier in TIER_PAIRS:
-        b = before.get(tier)
-        a = after.get(tier)
+    for name in CACHE_PAIRS:
+        b = before.get(name)
+        a = after.get(name)
         if b is None or a is None or a[0] - b[0] <= 0:
-            rates[tier] = None
+            rates[name] = None
         else:
-            rates[tier] = (a[1] - b[1]) / (a[0] - b[0])
+            rates[name] = (a[1] - b[1]) / (a[0] - b[0])
     return rates
 
 
@@ -165,8 +118,8 @@ def rate_text(value):
 def print_row(stage, avg_ttft, success, rates):
     print(
         f"{stage:<16}{avg_ttft:<12}{success:<10}"
-        f"{rate_text(rates['HBM']):<10}{rate_text(rates['DRAM']):<10}"
-        f"{rate_text(rates['SSD']):<10}"
+        f"{rate_text(rates['prefix_cache']):<16}"
+        f"{rate_text(rates['external_prefix_cache']):<20}"
     )
 
 
@@ -220,25 +173,25 @@ run_dir = OUTPUT_DIR / datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m
 json_dir = run_dir / "json"
 json_dir.mkdir(parents=True, exist_ok=True)
 vllm_bin = vllm()
-print(f"{'Stage':<16}{'Avg TTFT':<12}{'Success':<10}{'HBM':<10}{'DRAM':<10}{'SSD':<10}")
-print("-" * 68)
-before = tier_metrics()
+print(f"{'Stage':<16}{'Avg TTFT':<12}{'Success':<10}{'prefix_cache':<16}{'external_prefix_cache':<20}")
+print("-" * 74)
+before = cache_metrics()
 run(command(vllm_bin, json_dir, "warmup.json"))
 _, ok, failed = result_info(json_dir / "warmup.json")
-after = tier_metrics()
-print_row("Cache warmup", "-", f"{ok}/{ok + failed}", tier_rates(before, after))
+after = cache_metrics()
+print_row("Cache warmup", "-", f"{ok}/{ok + failed}", cache_rates(before, after))
 values = []
 successes = []
 batch_rates = []
 for batch in range(1, BATCHES + 1):
     filename = f"concurrency-001-batch-{batch:02d}.json"
-    before = tier_metrics()
+    before = cache_metrics()
     run(command(vllm_bin, json_dir, filename))
     value, ok, failed = result_info(json_dir / filename)
-    after = tier_metrics()
+    after = cache_metrics()
     values.append(value)
     successes.append((ok, failed))
-    rates = tier_rates(before, after)
+    rates = cache_rates(before, after)
     batch_rates.append(rates)
     print_row(f"Batch {batch}/{BATCHES}", f"{value:.6f}s", f"{ok}/{ok + failed}", rates)
 total_ok = sum(ok for ok, _ in successes)
@@ -246,13 +199,13 @@ total_failed = sum(failed for _, failed in successes)
 success_text = f"{total_ok}/{total_ok + total_failed}"
 
 
-def average_rate(tier):
-    rates = [row[tier] for row in batch_rates if row[tier] is not None]
+def average_rate(name):
+    rates = [row[name] for row in batch_rates if row[name] is not None]
     return statistics.fmean(rates) if rates else None
 
 
-final_rates = {tier: average_rate(tier) for tier in TIER_PAIRS}
-print("-" * 68)
+final_rates = {name: average_rate(name) for name in CACHE_PAIRS}
+print("-" * 74)
 print_row("Final", f"{statistics.fmean(values):.6f}s", success_text, final_rates)
 raw_rows = [["concurrency", "batch", "ttft_seconds"]]
 raw_rows.extend([1, batch, value] for batch, value in enumerate(values, start=1))
@@ -264,9 +217,8 @@ summary_rows = [
         "Avg TTFT",
         "min_ttft_seconds",
         "max_ttft_seconds",
-        "Prefix hit rate-HBM",
-        "Prefix hit rate-DRAM",
-        "Prefix hit rate-SSD",
+        "prefix_cache",
+        "external_prefix_cache",
     ],
     [
         1,
@@ -275,9 +227,8 @@ summary_rows = [
         statistics.fmean(values),
         min(values),
         max(values),
-        rate_text(final_rates["HBM"]),
-        rate_text(final_rates["DRAM"]),
-        rate_text(final_rates["SSD"]),
+        rate_text(final_rates["prefix_cache"]),
+        rate_text(final_rates["external_prefix_cache"]),
     ],
 ]
 write_xlsx(run_dir / "result_c1.xlsx", {"raw": raw_rows, "summary": summary_rows})
