@@ -185,6 +185,8 @@ _, ok, failed = result_info(json_dir / "warmup.json")
 after = tier_metrics()
 print_row("Cache warmup", "-", f"{ok}/{ok + failed}", tier_rates(before, after))
 values = []
+successes = []
+batch_rates = []
 for batch in range(1, BATCHES + 1):
     filename = f"concurrency-001-batch-{batch:02d}.json"
     before = tier_metrics()
@@ -192,13 +194,48 @@ for batch in range(1, BATCHES + 1):
     value, ok, failed = result_info(json_dir / filename)
     after = tier_metrics()
     values.append(value)
-    print_row(f"Batch {batch}/{BATCHES}", f"{value:.6f}s", f"{ok}/{ok + failed}", tier_rates(before, after))
+    successes.append((ok, failed))
+    rates = tier_rates(before, after)
+    batch_rates.append(rates)
+    print_row(f"Batch {batch}/{BATCHES}", f"{value:.6f}s", f"{ok}/{ok + failed}", rates)
+total_ok = sum(ok for ok, _ in successes)
+total_failed = sum(failed for _, failed in successes)
+success_text = f"{total_ok}/{total_ok + total_failed}"
+
+
+def average_rate(tier):
+    rates = [row[tier] for row in batch_rates if row[tier] is not None]
+    return statistics.fmean(rates) if rates else None
+
+
+final_rates = {tier: average_rate(tier) for tier in TIER_PAIRS}
+print("-" * 68)
+print_row("Final", f"{statistics.fmean(values):.6f}s", success_text, final_rates)
 raw_rows = [["concurrency", "batch", "ttft_seconds"]]
 raw_rows.extend([1, batch, value] for batch, value in enumerate(values, start=1))
 summary_rows = [
-    ["concurrency", "requests", "Avg TTFT", "min_ttft_seconds", "max_ttft_seconds"],
-    [1, len(values), statistics.fmean(values), min(values), max(values)],
+    [
+        "concurrency",
+        "requests",
+        "Success",
+        "Avg TTFT",
+        "min_ttft_seconds",
+        "max_ttft_seconds",
+        "Prefix hit rate-HBM",
+        "Prefix hit rate-DRAM",
+        "Prefix hit rate-SSD",
+    ],
+    [
+        1,
+        len(values),
+        success_text,
+        statistics.fmean(values),
+        min(values),
+        max(values),
+        rate_text(final_rates["HBM"]),
+        rate_text(final_rates["DRAM"]),
+        rate_text(final_rates["SSD"]),
+    ],
 ]
 write_xlsx(run_dir / "result_c1.xlsx", {"raw": raw_rows, "summary": summary_rows})
-print(f"Final Avg TTFT: {statistics.fmean(values):.6f}s")
 PY

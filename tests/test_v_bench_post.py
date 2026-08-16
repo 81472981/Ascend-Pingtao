@@ -206,6 +206,10 @@ class VBencPostTest(unittest.TestCase):
                 summary_xml = archive.read("xl/worksheets/sheet2.xml").decode()
                 self.assertIn("ttft_seconds", raw_xml)
                 self.assertIn("Avg TTFT", summary_xml)
+                self.assertIn("Success", summary_xml)
+                self.assertIn("Prefix hit rate-HBM", summary_xml)
+                self.assertIn("Prefix hit rate-DRAM", summary_xml)
+                self.assertIn("Prefix hit rate-SSD", summary_xml)
                 self.assertIn("0.013", summary_xml)
 
 
