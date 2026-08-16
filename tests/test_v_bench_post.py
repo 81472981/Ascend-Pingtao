@@ -198,7 +198,7 @@ class VBencPostTest(unittest.TestCase):
             )
 
             run_dir = next(output_dir.iterdir())
-            with (run_dir / "raw_ttft.csv").open(
+            with (run_dir / "raw_ttft_c1.csv").open(
                 encoding="utf-8-sig", newline=""
             ) as raw_file:
                 raw_rows = list(csv.DictReader(raw_file))
@@ -208,7 +208,7 @@ class VBencPostTest(unittest.TestCase):
                 {1},
             )
 
-            with (run_dir / "summary_ttft.csv").open(
+            with (run_dir / "summary_ttft_c1.csv").open(
                 encoding="utf-8-sig", newline=""
             ) as summary_file:
                 summary_row = next(csv.DictReader(summary_file))

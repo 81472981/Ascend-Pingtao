@@ -154,14 +154,14 @@ def main() -> None:
         values.append(ttft)
         print(f"  TTFT={ttft:.6f}s")
 
-    raw_path = run_dir / "raw_ttft.csv"
+    raw_path = run_dir / "raw_ttft_c1.csv"
     with raw_path.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.writer(file)
         writer.writerow(["concurrency", "batch", "ttft_seconds"])
         for batch, value in enumerate(values, start=1):
             writer.writerow([1, batch, f"{value:.9f}"])
 
-    summary_path = run_dir / "summary_ttft.csv"
+    summary_path = run_dir / "summary_ttft_c1.csv"
     with summary_path.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.writer(file)
         writer.writerow(
