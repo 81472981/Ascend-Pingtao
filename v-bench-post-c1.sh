@@ -52,10 +52,9 @@ def command(vllm_bin, result_dir, filename):
 
 
 def run(cmd):
-    print("  +", shlex.join(cmd))
     result = subprocess.run(cmd, text=True, capture_output=True)
     if result.returncode:
-        sys.exit("vllm failed:\n" + result.stderr[-2000:])
+        sys.exit(f"vllm failed: {shlex.join(cmd)}\n" + result.stderr[-2000:])
 
 
 def ttft(path):
@@ -68,18 +67,18 @@ json_dir = run_dir / "json"
 json_dir.mkdir(parents=True, exist_ok=True)
 vllm_bin = vllm()
 
-print("Warming prefix cache")
+print("[1/2] Warming prefix cache with 1 request")
 run(command(vllm_bin, json_dir, "warmup.json"))
 ttft(json_dir / "warmup.json")
 
+print("[2/2] Running 5 batches at concurrency=1")
 values = []
 for batch in range(1, BATCHES + 1):
     filename = f"concurrency-001-batch-{batch:02d}.json"
-    print(f"Batch {batch}/{BATCHES}")
     run(command(vllm_bin, json_dir, filename))
     value = ttft(json_dir / filename)
     values.append(value)
-    print(f"  TTFT={value:.6f}s")
+    print(f"  Batch {batch}/{BATCHES}: TTFT={value:.6f}s")
 
 raw_path = run_dir / "raw_ttft_c1.csv"
 with raw_path.open("w", encoding="utf-8-sig", newline="") as f:
@@ -94,7 +93,7 @@ with summary_path.open("w", encoding="utf-8-sig", newline="") as f:
     writer.writerow(["concurrency", "requests", "mean_ttft_seconds", "min_ttft_seconds", "max_ttft_seconds"])
     writer.writerow([1, len(values), f"{statistics.fmean(values):.9f}", f"{min(values):.9f}", f"{max(values):.9f}"])
 
+print(f"Mean TTFT: {statistics.fmean(values):.6f}s")
 print(f"Raw records: {raw_path}")
 print(f"Summary:     {summary_path}")
-print(f"Mean TTFT:   {statistics.fmean(values):.6f}s")
 PY
