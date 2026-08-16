@@ -68,32 +68,63 @@ def metric_sum(text, name):
     return total if found else None
 
 
-def prefix_metrics():
+TIER_PAIRS = {
+    "HBM": (
+        ("vllm:gpu_prefix_cache_queries_total", "vllm:gpu_prefix_cache_hits_total"),
+        ("vllm:gpu_prefix_cache_queries", "vllm:gpu_prefix_cache_hits"),
+    ),
+    "DRAM": (
+        ("vllm:cpu_prefix_cache_queries_total", "vllm:cpu_prefix_cache_hits_total"),
+        ("vllm:cpu_prefix_cache_queries", "vllm:cpu_prefix_cache_hits"),
+    ),
+    "SSD": (
+        ("vllm:disk_prefix_cache_queries_total", "vllm:disk_prefix_cache_hits_total"),
+        ("vllm:disk_prefix_cache_queries", "vllm:disk_prefix_cache_hits"),
+    ),
+}
+
+
+def tier_metrics():
     try:
         text = urllib.request.urlopen(
             f"http://{HOST}:{PORT}/metrics", timeout=2
         ).read().decode()
     except Exception:
-        return None
-    for query_name, hit_name in (
-        ("vllm:prefix_cache_queries_total", "vllm:prefix_cache_hits_total"),
-        ("vllm:gpu_prefix_cache_queries_total", "vllm:gpu_prefix_cache_hits_total"),
-    ):
-        queries = metric_sum(text, query_name)
-        hits = metric_sum(text, hit_name)
-        if queries is not None and hits is not None:
-            return queries, hits
-    return None
+        return {tier: None for tier in TIER_PAIRS}
+    result = {}
+    for tier, pairs in TIER_PAIRS.items():
+        result[tier] = None
+        for query_name, hit_name in pairs:
+            queries = metric_sum(text, query_name)
+            hits = metric_sum(text, hit_name)
+            if queries is not None and hits is not None:
+                result[tier] = (queries, hits)
+                break
+    return result
 
 
-def hit_rate(before, after):
-    if before is None or after is None:
-        return None
-    queries = after[0] - before[0]
-    hits = after[1] - before[1]
-    if queries <= 0:
-        return None
-    return hits / queries
+def tier_rates(before, after):
+    rates = {}
+    for tier in TIER_PAIRS:
+        b = before.get(tier)
+        a = after.get(tier)
+        if b is None or a is None or a[0] - b[0] <= 0:
+            rates[tier] = None
+        else:
+            rates[tier] = (a[1] - b[1]) / (a[0] - b[0])
+    return rates
+
+
+def rate_text(value):
+    return f"{value:.2%}" if value is not None else "N/A"
+
+
+def print_row(stage, avg_ttft, success, rates):
+    print(
+        f"{stage:<16}{avg_ttft:<12}{success:<10}"
+        f"{rate_text(rates['HBM']):<10}{rate_text(rates['DRAM']):<10}"
+        f"{rate_text(rates['SSD']):<10}"
+    )
 
 
 def col_name(index):
@@ -146,30 +177,22 @@ run_dir = OUTPUT_DIR / datetime.now(timezone(timedelta(hours=8))).strftime("%H%M
 json_dir = run_dir / "json"
 json_dir.mkdir(parents=True, exist_ok=True)
 vllm_bin = vllm()
-before = prefix_metrics()
+print(f"{'Stage':<16}{'Avg TTFT':<12}{'Success':<10}{'HBM':<10}{'DRAM':<10}{'SSD':<10}")
+print("-" * 68)
+before = tier_metrics()
 run(command(vllm_bin, json_dir, "warmup.json"))
 _, ok, failed = result_info(json_dir / "warmup.json")
-after = prefix_metrics()
-rate = hit_rate(before, after)
-warmup_rate = f"{rate:.2%}" if rate is not None else "N/A"
-print(
-    f"Cache warmup request: success={ok}/{ok + failed}, "
-    f"Prefix hit rate={warmup_rate}"
-)
+after = tier_metrics()
+print_row("Cache warmup", "-", f"{ok}/{ok + failed}", tier_rates(before, after))
 values = []
 for batch in range(1, BATCHES + 1):
     filename = f"concurrency-001-batch-{batch:02d}.json"
-    before = prefix_metrics()
+    before = tier_metrics()
     run(command(vllm_bin, json_dir, filename))
     value, ok, failed = result_info(json_dir / filename)
-    after = prefix_metrics()
-    rate = hit_rate(before, after)
-    batch_rate = f"{rate:.2%}" if rate is not None else "N/A"
+    after = tier_metrics()
     values.append(value)
-    print(
-        f"  Batch {batch}/{BATCHES}: Avg TTFT={value:.6f}s, "
-        f"success={ok}/{ok + failed}, Prefix hit rate={batch_rate}"
-    )
+    print_row(f"Batch {batch}/{BATCHES}", f"{value:.6f}s", f"{ok}/{ok + failed}", tier_rates(before, after))
 raw_rows = [["concurrency", "batch", "ttft_seconds"]]
 raw_rows.extend([1, batch, value] for batch, value in enumerate(values, start=1))
 summary_rows = [
