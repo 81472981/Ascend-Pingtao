@@ -118,4 +118,5 @@ summary_rows = [
     [1, len(values), statistics.fmean(values), min(values), max(values)],
 ]
 write_xlsx(run_dir / "result_c1.xlsx", {"raw": raw_rows, "summary": summary_rows})
+print(f"Final Avg TTFT: {statistics.fmean(values):.6f}s")
 PY
