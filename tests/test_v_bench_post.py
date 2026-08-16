@@ -205,6 +205,8 @@ class VBencPostTest(unittest.TestCase):
                 raw_xml = archive.read("xl/worksheets/sheet1.xml").decode()
                 summary_xml = archive.read("xl/worksheets/sheet2.xml").decode()
                 self.assertIn("<t>ttft</t>", raw_xml)
+                self.assertIn("<t>prefix_cache</t>", raw_xml)
+                self.assertIn("<t>external_prefix_cache</t>", raw_xml)
                 self.assertIn("Avg TTFT", summary_xml)
                 self.assertIn("Success", summary_xml)
                 self.assertIn("prefix_cache", summary_xml)

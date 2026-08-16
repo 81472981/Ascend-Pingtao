@@ -207,8 +207,17 @@ def average_rate(name):
 final_rates = {name: average_rate(name) for name in CACHE_PAIRS}
 print("-" * 74)
 print_row("Final", f"{statistics.fmean(values):.6f}s", success_text, final_rates)
-raw_rows = [["concurrency", "batch", "ttft"]]
-raw_rows.extend([1, batch, value] for batch, value in enumerate(values, start=1))
+raw_rows = [["concurrency", "batch", "ttft", "prefix_cache", "external_prefix_cache"]]
+raw_rows.extend(
+    [
+        1,
+        batch,
+        value,
+        rate_text(rates["prefix_cache"]),
+        rate_text(rates["external_prefix_cache"]),
+    ]
+    for batch, (value, rates) in enumerate(zip(values, batch_rates), start=1)
+)
 summary_rows = [
     [
         "concurrency",
