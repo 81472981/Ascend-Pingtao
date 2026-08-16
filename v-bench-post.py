@@ -432,7 +432,7 @@ def summarize(
         "batches": len({record.batch for record in records}),
         "requests": len(records),
         "failed_requests": failed,
-        "mean_ttft_seconds": statistics.fmean(values),
+        "Avg TTFT": statistics.fmean(values),
         "median_ttft_seconds": statistics.median(values),
         "p50_ttft_seconds": percentile(values, 50.0),
         "p95_ttft_seconds": percentile(values, 95.0),
@@ -491,7 +491,7 @@ def print_summaries(summaries: list[dict[str, object]]) -> None:
     print("\nTTFT summary:")
     for summary in summaries:
         concurrency = summary["concurrency"]
-        mean = summary["mean_ttft_seconds"]
+        mean = summary["Avg TTFT"]
         median = summary["median_ttft_seconds"]
         p99 = summary["p99_ttft_seconds"]
         print(

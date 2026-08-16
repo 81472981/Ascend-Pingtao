@@ -103,7 +103,7 @@ class VBencPostTest(unittest.TestCase):
             # For concurrency=1 and batch=1..3, values are
             # 0.011, 0.012, 0.013; mean is 0.012.
             self.assertAlmostEqual(
-                float(by_concurrency[1]["mean_ttft_seconds"]),
+                float(by_concurrency[1]["Avg TTFT"]),
                 0.012,
                 places=9,
             )
@@ -114,7 +114,7 @@ class VBencPostTest(unittest.TestCase):
             # 0.013, 0.0131, ...
             # Overall mean = 0.012 + mean(0..4)*0.0001 = 0.0122.
             self.assertAlmostEqual(
-                float(by_concurrency[5]["mean_ttft_seconds"]),
+                float(by_concurrency[5]["Avg TTFT"]),
                 0.0122,
                 places=9,
             )
@@ -205,7 +205,7 @@ class VBencPostTest(unittest.TestCase):
                 raw_xml = archive.read("xl/worksheets/sheet1.xml").decode()
                 summary_xml = archive.read("xl/worksheets/sheet2.xml").decode()
                 self.assertIn("ttft_seconds", raw_xml)
-                self.assertIn("mean_ttft_seconds", summary_xml)
+                self.assertIn("Avg TTFT", summary_xml)
                 self.assertIn("0.013", summary_xml)
 
 

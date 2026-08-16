@@ -174,7 +174,7 @@ raw_rows = [["concurrency", "batch", "ttft_seconds"]]
 raw_rows.extend([1, batch, value] for batch, value in enumerate(values, start=1))
 
 summary_rows = [
-    ["concurrency", "requests", "mean_ttft_seconds", "min_ttft_seconds", "max_ttft_seconds"],
+    ["concurrency", "requests", "Avg TTFT", "min_ttft_seconds", "max_ttft_seconds"],
     [1, len(values), statistics.fmean(values), min(values), max(values)],
 ]
 
