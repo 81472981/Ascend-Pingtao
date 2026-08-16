@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 "${PYTHON:-python3}" - <<'PY'
-import csv
 import json
 import os
 import shlex
@@ -8,8 +7,10 @@ import shutil
 import statistics
 import subprocess
 import sys
+import zipfile
 from datetime import datetime
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 HOST = "127.0.0.1"
 PORT = 8000
@@ -62,6 +63,96 @@ def ttft(path):
     return float(data["ttfts"][0])
 
 
+def col_name(index):
+    name = ""
+    while index >= 0:
+        name = chr(65 + index % 26) + name
+        index = index // 26 - 1
+    return name
+
+
+def sheet_xml(rows):
+    body = []
+    for row_index, row in enumerate(rows, start=1):
+        cells = []
+        for col_index, value in enumerate(row):
+            ref = f"{col_name(col_index)}{row_index}"
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                cells.append(f'<c r="{ref}"><v>{value}</v></c>')
+            else:
+                cells.append(
+                    f'<c r="{ref}" t="inlineStr"><is><t>{escape(str(value))}</t></is></c>'
+                )
+        body.append(f'<row r="{row_index}">{"".join(cells)}</row>')
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f'<sheetData>{"".join(body)}</sheetData></worksheet>'
+    )
+
+
+def write_xlsx(path, sheets):
+    content_types = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
+        '<Default Extension="xml" ContentType="application/xml"/>',
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>',
+    ]
+    workbook_rels = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+    ]
+    sheets_xml = []
+    for index, (name, rows) in enumerate(sheets.items(), start=1):
+        sheet_file = f"xl/worksheets/sheet{index}.xml"
+        content_types.append(
+            f'<Override PartName="/{sheet_file}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        )
+        workbook_rels.append(
+            f'<Relationship Id="rId{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{index}.xml"/>'
+        )
+        sheets_xml.append(
+            f'<sheet name="{escape(name)}" sheetId="{index}" r:id="rId{index}"/>'
+        )
+
+    styles_id = len(sheets) + 1
+    content_types.append(
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+    )
+    workbook_rels.append(
+        f'<Relationship Id="rId{styles_id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+    )
+    content_types.append("</Types>")
+    workbook_rels.append("</Relationships>")
+
+    workbook = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f'<sheets>{"".join(sheets_xml)}</sheets></workbook>'
+    )
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+        "</Relationships>"
+    )
+    styles = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>'
+    )
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", "".join(content_types))
+        archive.writestr("_rels/.rels", root_rels)
+        archive.writestr("xl/workbook.xml", workbook)
+        archive.writestr("xl/_rels/workbook.xml.rels", "".join(workbook_rels))
+        archive.writestr("xl/styles.xml", styles)
+        for index, (_, rows) in enumerate(sheets.items(), start=1):
+            archive.writestr(f"xl/worksheets/sheet{index}.xml", sheet_xml(rows))
+
+
 run_dir = OUTPUT_DIR / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
 json_dir = run_dir / "json"
 json_dir.mkdir(parents=True, exist_ok=True)
@@ -80,20 +171,17 @@ for batch in range(1, BATCHES + 1):
     values.append(value)
     print(f"  Batch {batch}/{BATCHES}: TTFT={value:.6f}s")
 
-raw_path = run_dir / "raw_ttft_c1.csv"
-with raw_path.open("w", encoding="utf-8-sig", newline="") as f:
-    writer = csv.writer(f)
-    writer.writerow(["concurrency", "batch", "ttft_seconds"])
-    for batch, value in enumerate(values, start=1):
-        writer.writerow([1, batch, f"{value:.9f}"])
+raw_rows = [["concurrency", "batch", "ttft_seconds"]]
+raw_rows.extend([1, batch, value] for batch, value in enumerate(values, start=1))
 
-summary_path = run_dir / "summary_ttft_c1.csv"
-with summary_path.open("w", encoding="utf-8-sig", newline="") as f:
-    writer = csv.writer(f)
-    writer.writerow(["concurrency", "requests", "mean_ttft_seconds", "min_ttft_seconds", "max_ttft_seconds"])
-    writer.writerow([1, len(values), f"{statistics.fmean(values):.9f}", f"{min(values):.9f}", f"{max(values):.9f}"])
+summary_rows = [
+    ["concurrency", "requests", "mean_ttft_seconds", "min_ttft_seconds", "max_ttft_seconds"],
+    [1, len(values), statistics.fmean(values), min(values), max(values)],
+]
+
+result_path = run_dir / "result_c1.xlsx"
+write_xlsx(result_path, {"raw": raw_rows, "summary": summary_rows})
 
 print(f"Mean TTFT: {statistics.fmean(values):.6f}s")
-print(f"Raw records: {raw_path}")
-print(f"Summary:     {summary_path}")
+print(f"Result:     {result_path}")
 PY

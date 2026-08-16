@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 
@@ -194,8 +195,18 @@ class VBencPostTest(unittest.TestCase):
                 msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
             )
             run_dir = next(output_dir.iterdir())
-            self.assertTrue((run_dir / "raw_ttft_c1.csv").is_file())
-            self.assertTrue((run_dir / "summary_ttft_c1.csv").is_file())
+            result_path = run_dir / "result_c1.xlsx"
+            self.assertTrue(result_path.is_file())
+            with zipfile.ZipFile(result_path) as archive:
+                self.assertEqual(archive.testzip(), None)
+                sheet_names = archive.read("xl/workbook.xml").decode()
+                self.assertIn('name="raw"', sheet_names)
+                self.assertIn('name="summary"', sheet_names)
+                raw_xml = archive.read("xl/worksheets/sheet1.xml").decode()
+                summary_xml = archive.read("xl/worksheets/sheet2.xml").decode()
+                self.assertIn("ttft_seconds", raw_xml)
+                self.assertIn("mean_ttft_seconds", summary_xml)
+                self.assertIn("0.013", summary_xml)
 
 
 if __name__ == "__main__":
