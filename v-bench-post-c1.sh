@@ -110,7 +110,7 @@ for batch in range(1, BATCHES + 1):
     run(command(vllm_bin, json_dir, filename))
     value = ttft(json_dir / filename)
     values.append(value)
-    print(f"  Batch {batch}/{BATCHES}: TTFT={value:.6f}s")
+    print(f"  Batch {batch}/{BATCHES}: Avg TTFT={value:.6f}s")
 raw_rows = [["concurrency", "batch", "ttft_seconds"]]
 raw_rows.extend([1, batch, value] for batch, value in enumerate(values, start=1))
 summary_rows = [
