@@ -13,9 +13,10 @@ SERVED_MODEL_NAME = os.environ.get("VB_SERVED_MODEL_NAME") or None
 TOKENIZER = os.environ.get("VB_TOKENIZER") or None
 VLLM_BIN = os.environ.get("VLLM_BIN", "vllm")
 OUTPUT_DIR = Path(os.environ.get("VB_OUT", "vbench-results"))
+# ====== Config: modify these as needed ======
 INPUT_LEN = 16 * 1024
+SQUEEZE_COUNT = int(os.environ.get("VB_SQUEEZE", "100"))   # requests to fill HBM
 BATCHES = int(os.environ.get("VB_BATCHES", "5"))
-SQUEEZE_COUNT = int(os.environ.get("VB_SQUEEZE", "100"))
 CONCURRENCIES = [int(x) for x in os.environ.get("VB_CONCURRENCIES", "1,5,10,100").split(",") if x.strip()]
 _INPUT_TEXT = None
 _CAPTURE_LOCK = threading.Lock()
@@ -259,6 +260,25 @@ def cache_metrics():
                 result[name] = (queries, hits)
                 break
     return result
+
+def check_swap(metrics_before, metrics_after):
+    """Check if KV cache was likely swapped to DRAM during squeeze."""
+    indicators = []
+    # Check preemptions (swap events)
+    preempt_name = "vllm:num_preemptions_total"
+    preempt_before = metric_sum(metrics_before, preempt_name)
+    preempt_after = metric_sum(metrics_after, preempt_name)
+    if preempt_before is not None and preempt_after is not None:
+        delta = preempt_after - preempt_before
+        indicators.append(f"preemptions: {preempt_before:.0f} -> {preempt_after:.0f} (+{delta:.0f})")
+    # Check GPU cache usage
+    for name in ("vllm:gpu_cache_usage_perc", "vllm:gpu_prefix_cache_usage_perc"):
+        val = metric_sum(metrics_after, name)
+        if val is not None:
+            indicators.append(f"gpu_cache_usage: {val:.1f}%")
+            break
+    return "; ".join(indicators) if indicators else "no swap metrics available"
+
 
 def cache_rates(before, after):
     rates = {}
@@ -630,6 +650,9 @@ detail_rows = request_details(
 
 # --- Squeeze phase: fill HBM to force warmup KV cache to DRAM ---
 print(f"\nSqueezing HBM with {SQUEEZE_COUNT} requests (different prefixes)...")
+metrics_before_squeeze = urllib.request.urlopen(
+    f"http://{HOST}:{PORT}/metrics", timeout=2
+).read().decode()
 begin_capture("squeeze", 1, 0)
 run(command_squeeze(vllm_bin, json_dir, "squeeze.json"))
 squeeze_captures = take_completion_captures()
@@ -637,7 +660,11 @@ all_capture_records.extend(squeeze_captures)
 _, ok, failed = result_info(json_dir / "squeeze.json", SQUEEZE_COUNT)
 if failed > 0:
     print(f"[FAIL] Squeeze: {failed} request(s) failed")
-print(f"Squeeze done: {ok}/{ok + failed} successful")
+metrics_after_squeeze = urllib.request.urlopen(
+    f"http://{HOST}:{PORT}/metrics", timeout=2
+).read().decode()
+swap_info = check_swap(metrics_before_squeeze, metrics_after_squeeze)
+print(f"Squeeze done: {ok}/{ok + failed} successful | {swap_info}")
 detail_rows.extend(
     request_details(
         json_dir / "squeeze.json", min(1, len(squeeze_captures)), "squeeze", 1, 0, squeeze_captures, input_text
