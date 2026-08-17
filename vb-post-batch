@@ -318,8 +318,10 @@ def _completion_output(body):
 def non_streaming_output(prompt, model=""):
     """Get one real non-streaming completion for fallback output text."""
     if not prompt:
+        print("[DEBUG fallback] prompt is empty, skipping")
         return ""
     model = model or SERVED_MODEL_NAME or MODEL or ""
+    print(f"[DEBUG fallback] model={model}, prompt_len={len(prompt)}")
 
     def first_text(data):
         choices = data.get("choices") or []
@@ -329,6 +331,8 @@ def non_streaming_output(prompt, model=""):
         text = choice.get("text")
         if isinstance(text, str) and text:
             return text
+        if isinstance(text, str) and not text:
+            print(f"[DEBUG fallback] text is empty string, choice keys: {list(choice.keys())}")
         message = choice.get("message")
         if isinstance(message, dict):
             content = message.get("content")
@@ -356,7 +360,7 @@ def non_streaming_output(prompt, model=""):
             "ignore_eos": True,
         },
     ]
-    for payload in payloads:
+    for i, payload in enumerate(payloads):
         try:
             request = urllib.request.Request(
                 f"http://{LLM_HOST}:{LLM_PORT}/v1/completions",
@@ -365,11 +369,23 @@ def non_streaming_output(prompt, model=""):
                 method="POST",
             )
             with urllib.request.urlopen(request, timeout=1800) as response:
-                text = first_text(json.loads(response.read().decode("utf-8")))
+                status = response.status
+                raw = response.read().decode("utf-8")
+                print(f"[DEBUG fallback] payload {i}: status={status}, body_len={len(raw)}, body_preview={raw[:300]}")
+                data = json.loads(raw)
+                text = first_text(data)
+                print(f"[DEBUG fallback] payload {i}: extracted text={repr(text)}")
             if text:
                 return text
-        except Exception:
+        except Exception as e:
+            print(f"[DEBUG fallback] payload {i}: exception {type(e).__name__}: {e}")
+            if hasattr(e, "read"):
+                try:
+                    print(f"[DEBUG fallback] payload {i}: error body: {e.read().decode('utf-8', 'replace')[:500]}")
+                except Exception:
+                    pass
             continue
+    print("[DEBUG fallback] all payloads failed, returning empty")
     return ""
 
 
@@ -699,6 +715,9 @@ first_captured = next(
 )
 fallback_prompt = first_captured.get("input") or input_text
 fallback_model = first_captured.get("model") or SERVED_MODEL_NAME or MODEL or ""
+print(f"[DEBUG] all_capture_records count: {len(all_capture_records)}")
+print(f"[DEBUG] first_captured has input: {bool(first_captured.get('input'))}, model: {first_captured.get('model', 'N/A')}")
+print(f"[DEBUG] fallback_prompt len: {len(fallback_prompt)}, fallback_model: {fallback_model}")
 fallback_output = non_streaming_output(fallback_prompt or "", fallback_model)
 if fallback_output:
     for row in detail_rows:
