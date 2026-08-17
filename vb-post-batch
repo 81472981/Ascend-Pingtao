@@ -24,7 +24,6 @@ _CAPTURE_CONCURRENCY = None
 _CAPTURE_BATCH = None
 _XML_INVALID = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\uFFFE\uFFFF]")
 
-
 def vllm():
     parts = shlex.split(VLLM_BIN)
     exe = parts[0]
@@ -36,7 +35,6 @@ def vllm():
             sys.exit(f"vllm not found: {parts[0]}")
         parts[0] = exe
     return parts
-
 
 def command(v, result_dir, filename, num_prompts):
     cmd = [
@@ -61,7 +59,6 @@ def command(v, result_dir, filename, num_prompts):
         extras += ["--tokenizer", TOKENIZER]
     return cmd + extras
 
-
 def run(cmd):
     result = subprocess.run(cmd, text=True, capture_output=True)
     if result.stderr.strip():
@@ -69,7 +66,6 @@ def run(cmd):
         print(f"[WARN] vllm stderr:\n" + "\n".join(stderr_tail))
     if result.returncode:
         sys.exit(f"vllm failed: {shlex.join(cmd)}\n{result.stderr[-2000:]}")
-
 
 def result_info(path, expected):
     data = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -85,7 +81,6 @@ def result_info(path, expected):
         values.append(float(ttfts[index]))
     return values, len(values), expected - len(values)
 
-
 def server_model_info():
     try:
         data = json.loads(
@@ -99,7 +94,6 @@ def server_model_info():
     except Exception:
         pass
     return None, None
-
 
 def discover_model():
     """Fill missing model fields from the running server."""
@@ -115,7 +109,6 @@ def discover_model():
         candidate = Path(MODEL).expanduser()
         if candidate.is_dir():
             TOKENIZER = str(candidate)
-
 
 def generated_prompt():
     """Return the exact 16K prompt vLLM uses, when importable.
@@ -164,7 +157,6 @@ def generated_prompt():
         pass
     return _INPUT_TEXT
 
-
 def request_details(path, expected, stage, concurrency, batch, captures, input_text):
     """Return one row per requested index, including failures."""
     data = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -180,10 +172,10 @@ def request_details(path, expected, stage, concurrency, batch, captures, input_t
         ttft = float(raw_ttft) if raw_ttft is not None else None
         success = not error and ttft is not None and ttft >= 0
         captured = captures[index] if index < len(captures) else {}
-        captured_input = captured.get("input") or input_text
-        captured_output = captured.get("output") or (
+        captured_input = _visible_text(captured.get("input") or input_text)
+        captured_output = _visible_text(captured.get("output") or (
             generated_texts[index] if index < len(generated_texts) else ""
-        )
+        ))
         captured_error = captured.get("error") or ""
         rows.append(
             [
@@ -203,7 +195,6 @@ def request_details(path, expected, stage, concurrency, batch, captures, input_t
         )
     return rows
 
-
 def metric_sum(text, name):
     total = 0.0
     found = False
@@ -217,7 +208,6 @@ def metric_sum(text, name):
                 pass
     return total if found else None
 
-
 CACHE_PAIRS = {
     "prefix_cache": (
         ("vllm:prefix_cache_queries_total", "vllm:prefix_cache_hits_total"),
@@ -228,7 +218,6 @@ CACHE_PAIRS = {
         ("vllm:external_prefix_cache_queries", "vllm:external_prefix_cache_hits"),
     ),
 }
-
 
 def cache_metrics():
     try:
@@ -248,7 +237,6 @@ def cache_metrics():
                 break
     return result
 
-
 def cache_rates(before, after):
     rates = {}
     for name in CACHE_PAIRS:
@@ -259,7 +247,6 @@ def cache_rates(before, after):
         else:
             rates[name] = (a[1] - b[1]) / (a[0] - b[0])
     return rates
-
 
 def _completion_prompt(body):
     try:
@@ -275,7 +262,6 @@ def _completion_prompt(body):
         return json.dumps(prompt, ensure_ascii=False)
     return ""
 
-
 def _completion_model(body):
     try:
         data = json.loads(body.decode("utf-8"))
@@ -285,7 +271,6 @@ def _completion_model(body):
         return ""
     model = data.get("model")
     return model if isinstance(model, str) else ""
-
 
 def _completion_output(body):
     text = body.decode("utf-8", "replace")
@@ -317,14 +302,12 @@ def _completion_output(body):
         pass
     return ""
 
-
 def non_streaming_output(prompt, model=""):
     """Get one real non-streaming completion for fallback output text."""
     if not prompt:
-        print("[DEBUG fallback] prompt is empty, skipping")
+
         return ""
     model = model or SERVED_MODEL_NAME or MODEL or ""
-    print(f"[DEBUG fallback] model={model}, prompt_len={len(prompt)}")
 
     def first_text(data):
         choices = data.get("choices") or []
@@ -334,8 +317,6 @@ def non_streaming_output(prompt, model=""):
         text = choice.get("text")
         if isinstance(text, str) and text:
             return text
-        if isinstance(text, str) and not text:
-            print(f"[DEBUG fallback] text is empty string, choice keys: {list(choice.keys())}")
         message = choice.get("message")
         if isinstance(message, dict):
             content = message.get("content")
@@ -374,23 +355,22 @@ def non_streaming_output(prompt, model=""):
             with urllib.request.urlopen(request, timeout=1800) as response:
                 status = response.status
                 raw = response.read().decode("utf-8")
-                print(f"[DEBUG fallback] payload {i}: status={status}, body_len={len(raw)}, body_preview={raw[:300]}")
+
                 data = json.loads(raw)
                 text = first_text(data)
-                print(f"[DEBUG fallback] payload {i}: extracted text={repr(text)}")
+
             if text:
                 return text
         except Exception as e:
-            print(f"[DEBUG fallback] payload {i}: exception {type(e).__name__}: {e}")
+            print(f"[FAIL] fallback request error: {type(e).__name__}: {e}")
             if hasattr(e, "read"):
                 try:
-                    print(f"[DEBUG fallback] payload {i}: error body: {e.read().decode('utf-8', 'replace')[:500]}")
+                    print(f"[FAIL] fallback error body: {e.read().decode('utf-8', 'replace')[:500]}")
                 except Exception:
                     pass
             continue
-    print("[DEBUG fallback] all payloads failed, returning empty")
-    return ""
 
+    return ""
 
 class _CaptureProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -505,7 +485,6 @@ class _CaptureProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         self._handle()
 
-
 def start_capture_proxy():
     global BENCH_HOST, BENCH_PORT
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _CaptureProxyHandler)
@@ -513,7 +492,6 @@ def start_capture_proxy():
     thread.start()
     BENCH_HOST, BENCH_PORT = "127.0.0.1", server.server_address[1]
     return server
-
 
 def begin_capture(stage, concurrency=None, batch=None):
     global _CAPTURE_STAGE, _CAPTURE_CONCURRENCY, _CAPTURE_BATCH
@@ -523,7 +501,6 @@ def begin_capture(stage, concurrency=None, batch=None):
         _CAPTURE_CONCURRENCY = concurrency
         _CAPTURE_BATCH = batch
 
-
 def take_completion_captures():
     with _CAPTURE_LOCK:
         return [
@@ -532,10 +509,8 @@ def take_completion_captures():
             if record.get("path", "").endswith("/v1/completions")
         ]
 
-
 def rate_text(value):
     return f"{value:.2%}" if value is not None else "N/A"
-
 
 def print_row(stage, avg_ttft, success, rates):
     print(
@@ -544,7 +519,6 @@ def print_row(stage, avg_ttft, success, rates):
         f"{rate_text(rates['external_prefix_cache']):<20}"
     )
 
-
 def col_name(index):
     name = ""
     while index >= 0:
@@ -552,6 +526,12 @@ def col_name(index):
         index = index // 26 - 1
     return name
 
+
+def _visible_text(s):
+    """Escape invisible chars so they show up in Excel cells."""
+    if not isinstance(s, str):
+        return s
+    return s.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
 
 def sheet_xml(rows):
     body = []
@@ -567,7 +547,6 @@ def sheet_xml(rows):
                 )
         body.append(f'<row r="{row_index}">{"".join(cells)}</row>')
     return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>' + ''.join(body) + '</sheetData></worksheet>'
-
 
 def write_xlsx(path, sheets):
     ct = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
@@ -601,7 +580,6 @@ def write_xlsx(path, sheets):
         z.writestr("xl/styles.xml", styles)
         for index, (_, rows) in enumerate(sheets.items(), start=1):
             z.writestr(f"xl/worksheets/sheet{index}.xml", sheet_xml(rows))
-
 
 run_dir = OUTPUT_DIR / datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d-%H%M%S")
 json_dir = run_dir / "json"
@@ -725,17 +703,15 @@ first_captured = next(
 )
 fallback_prompt = first_captured.get("input") or input_text
 fallback_model = first_captured.get("model") or SERVED_MODEL_NAME or MODEL or ""
-print(f"[DEBUG] all_capture_records count: {len(all_capture_records)}")
-print(f"[DEBUG] first_captured has input: {bool(first_captured.get('input'))}, model: {first_captured.get('model', 'N/A')}")
-print(f"[DEBUG] fallback_prompt len: {len(fallback_prompt)}, fallback_model: {fallback_model}")
+
 fallback_output = non_streaming_output(fallback_prompt or "", fallback_model)
 if fallback_output:
     for row in detail_rows:
         if not row[9]:
-            row[9] = fallback_output
+            row[9] = _visible_text(fallback_output)
     for record in all_capture_records:
         if not record.get("output"):
-            record["output"] = fallback_output
+            record["output"] = _visible_text(fallback_output)
 
 with (json_dir / "request_details.jsonl").open("w", encoding="utf-8") as detail_file:
     for record in all_capture_records:
