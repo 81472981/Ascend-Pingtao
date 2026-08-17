@@ -64,6 +64,37 @@ def result_info(path):
     return float(data["ttfts"][0]), ok, failed
 
 
+def server_model_info():
+    try:
+        data = json.loads(
+            urllib.request.urlopen(f"http://{HOST}:{PORT}/v1/models", timeout=2)
+            .read()
+            .decode()
+        )
+        models = data.get("data") or []
+        if models:
+            return models[0].get("id"), models[0].get("root")
+    except Exception:
+        pass
+    return None, None
+
+
+def discover_model():
+    """Fill missing model fields from the running server."""
+    global MODEL, SERVED_MODEL_NAME, TOKENIZER
+    if MODEL is not None and SERVED_MODEL_NAME is not None and TOKENIZER is not None:
+        return
+    served_name, root = server_model_info()
+    if MODEL is None:
+        MODEL = root or served_name
+    if SERVED_MODEL_NAME is None:
+        SERVED_MODEL_NAME = served_name or MODEL
+    if TOKENIZER is None and MODEL:
+        candidate = Path(MODEL).expanduser()
+        if candidate.is_dir():
+            TOKENIZER = str(candidate)
+
+
 def metric_sum(text, name):
     total = 0.0
     found = False
@@ -183,6 +214,7 @@ run_dir = OUTPUT_DIR / datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m
 json_dir = run_dir / "json"
 json_dir.mkdir(parents=True, exist_ok=True)
 vllm_bin = vllm()
+discover_model()
 print(f"{'Stage':<16}{'Avg TTFT':<12}{'Success':<10}{'prefix_cache':<16}{'external_prefix_cache':<20}")
 print("-" * 74)
 before = cache_metrics()

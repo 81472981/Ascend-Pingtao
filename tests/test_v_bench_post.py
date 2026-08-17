@@ -14,8 +14,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "v-bench-post.py"
-C1_SHELL_SCRIPT = REPO_ROOT / "v-bench-post-c1.sh"
-BATCH_SHELL_SCRIPT = REPO_ROOT / "v-bench-post-batch.sh"
+C1_SHELL_SCRIPT = REPO_ROOT / "vb-post"
+BATCH_SHELL_SCRIPT = REPO_ROOT / "vb-post-batch"
 FAKE_VLLM = REPO_ROOT / "tests" / "fake_vllm.py"
 
 
