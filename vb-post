@@ -620,7 +620,7 @@ with (json_dir / "request_details.jsonl").open("w", encoding="utf-8") as detail_
         detail_file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 write_xlsx(
-    run_dir / "result_c1.xlsx",
+    run_dir / f"result_c1_{datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d-%H%M%S")}.xlsx",
     {
         "raw": raw_rows,
         "summary": summary_rows,
