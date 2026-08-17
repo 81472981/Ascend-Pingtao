@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
 "${PYTHON:-python3}" - <<'PY'
-import json, os, shlex, shutil, statistics, subprocess, sys, urllib.request, zipfile
+import http.client, http.server, json, os, shlex, shutil, statistics, subprocess, sys, threading, urllib.request, zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from xml.sax.saxutils import escape
 
 HOST, PORT = "127.0.0.1", 8000
+LLM_HOST, LLM_PORT = HOST, PORT
+BENCH_HOST, BENCH_PORT = HOST, PORT
 MODEL = os.environ.get("VB_MODEL") or None
 SERVED_MODEL_NAME = os.environ.get("VB_SERVED_MODEL_NAME") or None
 TOKENIZER = os.environ.get("VB_TOKENIZER") or None
 VLLM_BIN = os.environ.get("VLLM_BIN", "vllm")
 OUTPUT_DIR = Path(os.environ.get("VB_OUT", "vbench-results"))
 INPUT_LEN, BATCHES = 16 * 1024, 5
+_CAPTURE_LOCK = threading.Lock()
+_CAPTURE_RECORDS = []
+_CAPTURE_STAGE = None
+_CAPTURE_CONCURRENCY = None
+_CAPTURE_BATCH = None
 
 
 def vllm():
@@ -29,7 +36,7 @@ def vllm():
 
 def command(v, result_dir, filename):
     cmd = [
-        *v, "bench", "serve", "--host", HOST, "--port", str(PORT),
+        *v, "bench", "serve", "--host", BENCH_HOST, "--port", str(BENCH_PORT),
         "--endpoint", "/v1/completions", "--backend", "openai",
         "--dataset-name", "prefix_repetition", "--num-prompts", "1",
         "--max-concurrency", "1", "--request-rate", "inf",
@@ -93,6 +100,219 @@ def discover_model():
         candidate = Path(MODEL).expanduser()
         if candidate.is_dir():
             TOKENIZER = str(candidate)
+
+
+def _completion_prompt(body):
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    prompt = data.get("prompt")
+    if isinstance(prompt, str):
+        return prompt
+    if isinstance(prompt, list):
+        return json.dumps(prompt, ensure_ascii=False)
+    return ""
+
+
+def _completion_output(body):
+    text = body.decode("utf-8", "replace")
+    if "data:" in text:
+        parts = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                chunk = json.loads(payload)
+            except Exception:
+                continue
+            choices = chunk.get("choices") or []
+            if choices and isinstance(choices[0], dict):
+                token = choices[0].get("text")
+                if isinstance(token, str):
+                    parts.append(token)
+        return "".join(parts)
+    try:
+        data = json.loads(text)
+        choices = data.get("choices") or []
+        if choices and isinstance(choices[0], dict):
+            return choices[0].get("text") or ""
+    except Exception:
+        pass
+    return ""
+
+
+class _CaptureProxyHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _handle(self):
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        request_body = self.rfile.read(length) if length else b""
+        path = self.path.split("?", 1)[0]
+        record_index = None
+
+        if self.command == "POST" and path.endswith("/v1/completions"):
+            with _CAPTURE_LOCK:
+                record_index = len(_CAPTURE_RECORDS)
+                request_index = (
+                    sum(
+                        1
+                        for record in _CAPTURE_RECORDS
+                        if record.get("path", "").endswith("/v1/completions")
+                    )
+                    + 1
+                )
+                _CAPTURE_RECORDS.append(
+                    {
+                        "stage": _CAPTURE_STAGE,
+                        "concurrency": _CAPTURE_CONCURRENCY,
+                        "batch": _CAPTURE_BATCH,
+                        "request_index": request_index,
+                        "path": path,
+                        "input": _completion_prompt(request_body),
+                        "output": "",
+                        "status": None,
+                        "error": "",
+                    }
+                )
+
+        connection = http.client.HTTPConnection(LLM_HOST, LLM_PORT, timeout=1800)
+        forward_headers = {}
+        for key, value in self.headers.items():
+            lower_key = key.lower()
+            if lower_key in ("host", "content-length", "connection", "accept-encoding"):
+                continue
+            forward_headers[key] = value
+        forward_headers["Host"] = f"{LLM_HOST}:{LLM_PORT}"
+
+        try:
+            connection.request(
+                self.command,
+                self.path,
+                body=request_body,
+                headers=forward_headers,
+            )
+            upstream = connection.getresponse()
+            status = upstream.status
+
+            self.send_response(status)
+            for key, value in upstream.getheaders():
+                lower_key = key.lower()
+                if lower_key in (
+                    "content-length",
+                    "transfer-encoding",
+                    "connection",
+                    "keep-alive",
+                ):
+                    continue
+                self.send_header(key, value)
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+            response_body = bytearray()
+            while True:
+                chunk = upstream.read1(65536)
+                if not chunk:
+                    break
+                response_body.extend(chunk)
+                self.wfile.write(chunk)
+                self.wfile.flush()
+            self.close_connection = True
+            response_bytes = bytes(response_body)
+        except Exception as error:
+            if record_index is not None:
+                with _CAPTURE_LOCK:
+                    _CAPTURE_RECORDS[record_index]["status"] = 502
+                    _CAPTURE_RECORDS[record_index]["error"] = str(error)
+            try:
+                self.send_response(502)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(str(error).encode())
+            except Exception:
+                pass
+            return
+        finally:
+            connection.close()
+
+        if record_index is not None:
+            with _CAPTURE_LOCK:
+                _CAPTURE_RECORDS[record_index]["status"] = status
+                if status == 200:
+                    _CAPTURE_RECORDS[record_index]["output"] = _completion_output(
+                        response_bytes
+                    )
+
+    def do_GET(self):
+        self._handle()
+
+    def do_POST(self):
+        self._handle()
+
+
+def start_capture_proxy():
+    global BENCH_HOST, BENCH_PORT
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _CaptureProxyHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    BENCH_HOST, BENCH_PORT = "127.0.0.1", server.server_address[1]
+    return server
+
+
+def begin_capture(stage, concurrency=None, batch=None):
+    global _CAPTURE_STAGE, _CAPTURE_CONCURRENCY, _CAPTURE_BATCH
+    with _CAPTURE_LOCK:
+        _CAPTURE_RECORDS.clear()
+        _CAPTURE_STAGE = stage
+        _CAPTURE_CONCURRENCY = concurrency
+        _CAPTURE_BATCH = batch
+
+
+def take_completion_captures():
+    with _CAPTURE_LOCK:
+        return [
+            record
+            for record in _CAPTURE_RECORDS
+            if record.get("path", "").endswith("/v1/completions")
+        ]
+
+
+def request_details(path, captures, stage, batch):
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    ttfts = data.get("ttfts") or []
+    errors = data.get("errors") or []
+    input_lens = data.get("input_lens") or []
+    output_lens = data.get("output_lens") or []
+    generated_texts = data.get("generated_texts") or []
+    captured = captures[0] if captures else {}
+    raw_ttft = ttfts[0] if ttfts else None
+    ttft = float(raw_ttft) if raw_ttft is not None else None
+    error = errors[0] if errors else None
+    success = not error and ttft is not None and ttft >= 0
+    return [
+        stage,
+        1,
+        batch,
+        1,
+        "success" if success else "failed",
+        ttft if ttft is not None else "",
+        input_lens[0] if input_lens else "",
+        output_lens[0] if output_lens else "",
+        captured.get("input") or "",
+        captured.get("output") or (generated_texts[0] if generated_texts else ""),
+        captured.get("error") or error or "",
+        Path(path).name,
+    ]
 
 
 def metric_sum(text, name):
@@ -215,24 +435,34 @@ json_dir = run_dir / "json"
 json_dir.mkdir(parents=True, exist_ok=True)
 vllm_bin = vllm()
 discover_model()
+start_capture_proxy()
+all_capture_records = []
 print(f"{'Stage':<16}{'Avg TTFT':<12}{'Success':<10}{'prefix_cache':<16}{'external_prefix_cache':<20}")
 print("-" * 74)
 before = cache_metrics()
+begin_capture("warmup", 1, 0)
 run(command(vllm_bin, json_dir, "warmup.json"))
+warmup_captures = take_completion_captures()
+all_capture_records.extend(warmup_captures)
 _, ok, failed = result_info(json_dir / "warmup.json")
 after = cache_metrics()
 print_row("Cache warmup", "-", f"{ok}/{ok + failed}", cache_rates(before, after))
+detail_rows = [request_details(json_dir / "warmup.json", warmup_captures, "warmup", 0)]
 values = []
 successes = []
 batch_rates = []
 for batch in range(1, BATCHES + 1):
     filename = f"concurrency-001-batch-{batch:02d}.json"
     before = cache_metrics()
+    begin_capture("benchmark", 1, batch)
     run(command(vllm_bin, json_dir, filename))
+    captures = take_completion_captures()
+    all_capture_records.extend(captures)
     value, ok, failed = result_info(json_dir / filename)
     after = cache_metrics()
     values.append(value)
     successes.append((ok, failed))
+    detail_rows.append(request_details(json_dir / filename, captures, "benchmark", batch))
     rates = cache_rates(before, after)
     batch_rates.append(rates)
     print_row(f"Batch {batch}/{BATCHES}", f"{value:.6f}s", f"{ok}/{ok + failed}", rates)
@@ -282,5 +512,32 @@ summary_rows = [
         rate_text(final_rates["external_prefix_cache"]),
     ],
 ]
-write_xlsx(run_dir / "result_c1.xlsx", {"raw": raw_rows, "summary": summary_rows})
+with (json_dir / "request_details.jsonl").open("w", encoding="utf-8") as detail_file:
+    for record in all_capture_records:
+        detail_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+write_xlsx(
+    run_dir / "result_c1.xlsx",
+    {
+        "raw": raw_rows,
+        "summary": summary_rows,
+        "request_details": [
+            [
+                "stage",
+                "concurrency",
+                "batch",
+                "request_index",
+                "success",
+                "ttft",
+                "input_tokens",
+                "output_tokens",
+                "input_text",
+                "output_text",
+                "error",
+                "result_file",
+            ],
+            *detail_rows,
+        ],
+    },
+)
 PY
