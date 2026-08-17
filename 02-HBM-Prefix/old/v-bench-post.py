@@ -167,7 +167,7 @@ def resolve_command_prefix(vllm_bin: str) -> list[str]:
             raise SystemExit(f"vllm executable does not exist: {executable}")
     elif shutil.which(executable) is None:
         # A project-local virtualenv is common for vLLM setups.
-        local_candidate = Path(".venv/bin") / executable
+        local_candidate = Path("../../.venv/bin") / executable
         if local_candidate.is_file():
             parts[0] = str(local_candidate.resolve())
         else:
