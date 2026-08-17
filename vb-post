@@ -149,6 +149,37 @@ def _completion_output(body):
     return ""
 
 
+def non_streaming_output(prompt):
+    """Get one real non-streaming completion for fallback output text."""
+    if not prompt:
+        return ""
+    payload = json.dumps(
+        {
+            "model": SERVED_MODEL_NAME or MODEL or "",
+            "prompt": prompt,
+            "max_tokens": 1,
+            "temperature": 0,
+            "ignore_eos": True,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"http://{LLM_HOST}:{LLM_PORT}/v1/completions",
+        data=payload,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=1800) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        choices = data.get("choices") or []
+        if choices and isinstance(choices[0], dict):
+            return choices[0].get("text") or ""
+    except Exception:
+        return ""
+    return ""
+
+
 class _CaptureProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -515,6 +546,20 @@ summary_rows = [
         rate_text(final_rates["external_prefix_cache"]),
     ],
 ]
+
+first_captured_input = next(
+    (record.get("input") for record in all_capture_records if record.get("input")),
+    "",
+)
+fallback_output = non_streaming_output(first_captured_input or "")
+if fallback_output:
+    for row in detail_rows:
+        if not row[9]:
+            row[9] = fallback_output
+    for record in all_capture_records:
+        if not record.get("output"):
+            record["output"] = fallback_output
+
 with (json_dir / "request_details.jsonl").open("w", encoding="utf-8") as detail_file:
     for record in all_capture_records:
         detail_file.write(json.dumps(record, ensure_ascii=False) + "\n")
