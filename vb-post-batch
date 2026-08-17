@@ -61,9 +61,6 @@ def command(v, result_dir, filename, num_prompts):
 
 def run(cmd):
     result = subprocess.run(cmd, text=True, capture_output=True)
-    if result.stderr.strip():
-        stderr_tail = result.stderr.strip().split("\n")[-5:]
-        print(f"[WARN] vllm stderr:\n" + "\n".join(stderr_tail))
     if result.returncode:
         sys.exit(f"vllm failed: {shlex.join(cmd)}\n{result.stderr[-2000:]}")
 
