@@ -5,7 +5,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-HOST, PORT, MODEL = "127.0.0.1", 8000, None
+HOST, PORT = "127.0.0.1", 8000
+MODEL = os.environ.get("VB_MODEL") or None
+SERVED_MODEL_NAME = os.environ.get("VB_SERVED_MODEL_NAME") or None
+TOKENIZER = os.environ.get("VB_TOKENIZER") or None
 VLLM_BIN = os.environ.get("VLLM_BIN", "vllm")
 OUTPUT_DIR = Path(os.environ.get("VB_OUT", "vbench-results"))
 INPUT_LEN, BATCHES = 16 * 1024, 5
@@ -38,7 +41,14 @@ def command(v, result_dir, filename):
         "--save-result", "--save-detailed", "--result-dir", str(result_dir),
         "--result-filename", filename,
     ]
-    return cmd + (["--model", MODEL] if MODEL else [])
+    extras = []
+    if MODEL:
+        extras += ["--model", MODEL]
+    if SERVED_MODEL_NAME:
+        extras += ["--served-model-name", SERVED_MODEL_NAME]
+    if TOKENIZER:
+        extras += ["--tokenizer", TOKENIZER]
+    return cmd + extras
 
 
 def run(cmd):
