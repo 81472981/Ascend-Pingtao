@@ -16,7 +16,6 @@ SQUEEZE_TOTAL = int(os.environ.get("VB_SQUEEZE", "200"))
 SQUEEZE_BATCH = int(os.environ.get("VB_SQUEEZE_BATCH", "10"))
 SQUEEZE_CONC = int(os.environ.get("VB_SQUEEZE_CONC", "10"))
 GPU_TARGET = float(os.environ.get("VB_GPU_TARGET", "95"))
-DRAM_TTFT_RATIO = float(os.environ.get("VB_DRAM_RATIO", "2.0"))  # TTFT > baseline * ratio -> DRAM
 
 def vllm():
     parts = shlex.split(VLLM_BIN)
@@ -106,57 +105,61 @@ def snapshot():
             break
     return preempt, gpu
 
-def cache_hits_delta(m_before, m_after):
-    """Return (prefix_cache_hits_delta, prefix_cache_queries_delta) or None."""
-    for hit_name, query_name in [
-        ("vllm:prefix_cache_hits_total", "vllm:prefix_cache_queries_total"),
-        ("vllm:prefix_cache_hits", "vllm:prefix_cache_queries"),
-    ]:
-        h1 = metric_val(m_before, hit_name)
-        h2 = metric_val(m_after, hit_name)
-        q1 = metric_val(m_before, query_name)
-        q2 = metric_val(m_after, query_name)
-        if all(v is not None for v in (h1, h2, q1, q2)):
-            return h2 - h1, q2 - q1
-    return None
+def swapped_tokens(m):
+    """Return number of tokens currently swapped to CPU, or None if unavailable."""
+    for name in ("vllm:num_swapped_tokens", "vllm:cpu_cache_usage_perc",
+                 "vllm:num_cpu_blocks_used", "vllm:num_preempted_tokens"):
+        val = metric_val(m, name)
+        if val is not None:
+            return val, name
+    return None, None
 
-def verify_dram(baseline_ttft):
-    """Send a test request with warmup prefix (seed=0) and check if it hits DRAM."""
+def verify_dram():
+    """
+    Reliable DRAM detection: send prefix P request, check if swapped tokens decreased.
+    If swapped_tokens drops after serving P -> P's blocks were in DRAM and got swapped back.
+    """
     m_before = get_metrics()
+    swapped_before, swapped_name = swapped_tokens(m_before)
+    preempt_before = metric_val(m_before, "vllm:num_preemptions_total")
+
     run(bench_cmd(1, 1, 0, 1, "verify.json"))
+
     m_after = get_metrics()
+    swapped_after, _ = swapped_tokens(m_after)
+    preempt_after = metric_val(m_after, "vllm:num_preemptions_total")
 
     # Read TTFT
     try:
         data = json.loads((json_dir / "verify.json").read_text())
-        ttfts = data.get("ttfts") or []
-        ttft = float(ttfts[0]) if ttfts else None
+        ttft = float(data["ttfts"][0]) if data.get("ttfts") else None
     except Exception:
         ttft = None
 
-    # Check prefix cache hits
-    delta = cache_hits_delta(m_before, m_after)
-    if delta:
-        hits_delta, queries_delta = delta
-        cache_info = f"prefix_cache: +{hits_delta:.0f} hits / +{queries_delta:.0f} queries"
-    else:
-        cache_info = "prefix_cache: N/A"
-
-    # Check preemptions
-    preempt_before = metric_val(m_before, "vllm:num_preemptions_total")
-    preempt_after = metric_val(m_after, "vllm:num_preemptions_total")
+    # Build info string
+    parts = []
+    if ttft is not None:
+        parts.append(f"TTFT={ttft:.4f}s")
     if preempt_before is not None and preempt_after is not None:
-        preempt_info = f"preemptions: {preempt_before:.0f} -> {preempt_after:.0f}"
-    else:
-        preempt_info = "preemptions: N/A"
+        parts.append(f"preemptions={preempt_before:.0f}->{preempt_after:.0f}")
+    if swapped_before is not None and swapped_after is not None:
+        parts.append(f"{swapped_name}={swapped_before:.0f}->{swapped_after:.0f}")
 
-    if ttft is not None and baseline_ttft is not None and baseline_ttft > 0:
-        ratio = ttft / baseline_ttft
-        if ratio >= DRAM_TTFT_RATIO:
-            return True, f"TTFT {ttft:.4f}s ({ratio:.1f}x baseline) | {cache_info} | {preempt_info}"
+    # Core logic: if swapped tokens decreased, prefix P was in DRAM
+    if swapped_before is not None and swapped_after is not None:
+        if swapped_before > 0 and swapped_after < swapped_before:
+            return True, f"DRAM confirmed (swapped tokens dropped: {swapped_before:.0f} -> {swapped_after:.0f}) | " + " | ".join(parts)
+        elif swapped_before > 0:
+            return False, f"Swapped tokens unchanged ({swapped_before:.0f}) - prefix P may still be in HBM | " + " | ".join(parts)
         else:
-            return False, f"TTFT {ttft:.4f}s ({ratio:.1f}x baseline, still in HBM) | {cache_info} | {preempt_info}"
-    return False, f"TTFT N/A | {cache_info} | {preempt_info}"
+            return False, f"No swapped tokens (0) - nothing in DRAM | " + " | ".join(parts)
+
+    # Fallback: if no swapped metrics, check preemptions + GPU
+    _, gpu = snapshot()
+    if preempt_after is not None and preempt_before is not None:
+        if preempt_after > preempt_before and gpu is not None and gpu >= GPU_TARGET:
+            return True, f"Likely DRAM (preemptions +{preempt_after-preempt_before:.0f}, GPU={gpu:.1f}%) | " + " | ".join(parts)
+    return False, "Cannot confirm DRAM (no swap metrics) | " + " | ".join(parts)
 
 # --- Main ---
 vllm_bin = vllm()
@@ -167,10 +170,10 @@ json_dir.mkdir(parents=True, exist_ok=True)
 print(f"Model: {MODEL}")
 print(f"Input len: {INPUT_LEN} tokens")
 print(f"Squeeze: up to {SQUEEZE_TOTAL} requests, batch={SQUEEZE_BATCH}, concurrency={SQUEEZE_CONC}")
-print(f"Target: GPU cache >= {GPU_TARGET}%, DRAM TTFT >= {DRAM_TTFT_RATIO}x baseline")
+print(f"Target: GPU cache >= {GPU_TARGET}%")
 print()
 
-# Step 1: Warmup + baseline TTFT
+# Step 1: Warmup
 print("[1/4] Warmup: establishing KV cache in HBM...")
 run(bench_cmd(1, 1, 0, 1, "warmup.json"))
 try:
@@ -219,30 +222,32 @@ preempt_final, gpu_final = snapshot()
 print(f"\n  Sent {total_sent} requests. Preemptions: {preempt_final:.0f}, GPU cache: {gpu_final:.1f}%"
       if preempt_final is not None and gpu_final is not None else f"\n  Sent {total_sent} requests.")
 
-# Step 3: Verify DRAM residence
-print(f"\n[3/4] Verifying warmup prefix is in DRAM (TTFT >= {DRAM_TTFT_RATIO}x baseline)...")
-is_dram, msg = verify_dram(baseline_ttft)
+# Step 3: Verify DRAM via swapped tokens delta
+print(f"\n[3/4] Verifying: sending prefix P, checking if swapped tokens drop...")
+print(f"  (If swapped_tokens decreases after request, P's blocks were in DRAM and got swapped back)")
+is_dram, msg = verify_dram()
 print(f"  {msg}")
 
-# Step 4: If not in DRAM yet, squeeze more
-if not is_dram and total_sent < SQUEEZE_TOTAL * 2:
-    extra = SQUEEZE_TOTAL
-    print(f"\n[4/4] Not in DRAM yet. Sending {extra} more requests...")
-    for i in range(extra // SQUEEZE_BATCH):
+# Step 4: Retry if not confirmed
+retries = 0
+while not is_dram and retries < 2 and total_sent < SQUEEZE_TOTAL * 3:
+    retries += 1
+    extra = SQUEEZE_TOTAL // 2
+    print(f"\n[4/4] Not confirmed. Squeezing {extra} more (retry {retries}/2)...")
+    for i in range(max(extra // SQUEEZE_BATCH, 1)):
         batch_count = min(SQUEEZE_BATCH, extra - i * SQUEEZE_BATCH)
-        seed = batch_num + i + 1000
-        run(bench_cmd(batch_count, min(SQUEEZE_CONC, batch_count), seed, batch_count, f"squeeze-extra-{i:03d}.json"))
+        if batch_count <= 0:
+            break
+        seed = batch_num + i + retries * 1000
+        run(bench_cmd(batch_count, min(SQUEEZE_CONC, batch_count), seed, batch_count, f"squeeze-r{retries}-{i:03d}.json"))
         total_sent += batch_count
     preempt_final, gpu_final = snapshot()
     print(f"  Sent {total_sent} total. Preemptions: {preempt_final:.0f}, GPU: {gpu_final:.1f}%"
           if preempt_final is not None and gpu_final is not None else f"  Sent {total_sent} total.")
-    print(f"  Re-verifying...")
-    is_dram, msg = verify_dram(baseline_ttft)
+    is_dram, msg = verify_dram()
     print(f"  {msg}")
-else:
-    print(f"\n[4/4] Skipping extra squeeze (already verified or max requests reached).")
 
 print(f"\nFinal: {'DRAM confirmed' if is_dram else 'DRAM NOT confirmed - may need more squeeze'}")
-print(f"Baseline TTFT (HBM): {baseline_ttft:.4f}s" if baseline_ttft else "Baseline TTFT: N/A")
+print(f"Total requests sent: {total_sent}")
 print(f"Run: bash bench-dram")
 PY
