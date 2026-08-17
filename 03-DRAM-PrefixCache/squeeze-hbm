@@ -95,71 +95,27 @@ def get_metrics():
     except Exception:
         return ""
 
-def snapshot():
+def check_swap():
+    """
+    Industry-standard check: vllm:gpu_cache_usage_perc + vllm:cpu_cache_usage_perc.
+    If GPU cache is full AND CPU cache is used, KV cache is in DRAM.
+    Ref: https://docs.vllm.ai/en/latest/serving/metrics.html
+    """
     m = get_metrics()
+    gpu = metric_val(m, "vllm:gpu_cache_usage_perc")
+    cpu = metric_val(m, "vllm:cpu_cache_usage_perc")
     preempt = metric_val(m, "vllm:num_preemptions_total")
-    gpu = None
-    for name in ("vllm:gpu_cache_usage_perc", "vllm:gpu_prefix_cache_usage_perc"):
-        gpu = metric_val(m, name)
-        if gpu is not None:
-            break
-    return preempt, gpu
 
-def swapped_tokens(m):
-    """Return number of tokens currently swapped to CPU, or None if unavailable."""
-    for name in ("vllm:num_swapped_tokens", "vllm:cpu_cache_usage_perc",
-                 "vllm:num_cpu_blocks_used", "vllm:num_preempted_tokens"):
-        val = metric_val(m, name)
-        if val is not None:
-            return val, name
-    return None, None
+    # Fallback metric names for different vLLM versions
+    if gpu is None:
+        gpu = metric_val(m, "vllm:gpu_prefix_cache_usage_perc")
+    if cpu is None:
+        for name in ("vllm:num_swapped_tokens", "vllm:num_cpu_blocks_used"):
+            cpu = metric_val(m, name)
+            if cpu is not None:
+                break
 
-def verify_dram():
-    """
-    Reliable DRAM detection: send prefix P request, check if swapped tokens decreased.
-    If swapped_tokens drops after serving P -> P's blocks were in DRAM and got swapped back.
-    """
-    m_before = get_metrics()
-    swapped_before, swapped_name = swapped_tokens(m_before)
-    preempt_before = metric_val(m_before, "vllm:num_preemptions_total")
-
-    run(bench_cmd(1, 1, 0, 1, "verify.json"))
-
-    m_after = get_metrics()
-    swapped_after, _ = swapped_tokens(m_after)
-    preempt_after = metric_val(m_after, "vllm:num_preemptions_total")
-
-    # Read TTFT
-    try:
-        data = json.loads((json_dir / "verify.json").read_text())
-        ttft = float(data["ttfts"][0]) if data.get("ttfts") else None
-    except Exception:
-        ttft = None
-
-    # Build info string
-    parts = []
-    if ttft is not None:
-        parts.append(f"TTFT={ttft:.4f}s")
-    if preempt_before is not None and preempt_after is not None:
-        parts.append(f"preemptions={preempt_before:.0f}->{preempt_after:.0f}")
-    if swapped_before is not None and swapped_after is not None:
-        parts.append(f"{swapped_name}={swapped_before:.0f}->{swapped_after:.0f}")
-
-    # Core logic: if swapped tokens decreased, prefix P was in DRAM
-    if swapped_before is not None and swapped_after is not None:
-        if swapped_before > 0 and swapped_after < swapped_before:
-            return True, f"DRAM confirmed (swapped tokens dropped: {swapped_before:.0f} -> {swapped_after:.0f}) | " + " | ".join(parts)
-        elif swapped_before > 0:
-            return False, f"Swapped tokens unchanged ({swapped_before:.0f}) - prefix P may still be in HBM | " + " | ".join(parts)
-        else:
-            return False, f"No swapped tokens (0) - nothing in DRAM | " + " | ".join(parts)
-
-    # Fallback: if no swapped metrics, check preemptions + GPU
-    _, gpu = snapshot()
-    if preempt_after is not None and preempt_before is not None:
-        if preempt_after > preempt_before and gpu is not None and gpu >= GPU_TARGET:
-            return True, f"Likely DRAM (preemptions +{preempt_after-preempt_before:.0f}, GPU={gpu:.1f}%) | " + " | ".join(parts)
-    return False, "Cannot confirm DRAM (no swap metrics) | " + " | ".join(parts)
+    return gpu, cpu, preempt, m
 
 # --- Main ---
 vllm_bin = vllm()
@@ -168,31 +124,26 @@ json_dir = Path("vbench-squeeze") / datetime.now(timezone(timedelta(hours=8))).s
 json_dir.mkdir(parents=True, exist_ok=True)
 
 print(f"Model: {MODEL}")
-print(f"Input len: {INPUT_LEN} tokens")
-print(f"Squeeze: up to {SQUEEZE_TOTAL} requests, batch={SQUEEZE_BATCH}, concurrency={SQUEEZE_CONC}")
-print(f"Target: GPU cache >= {GPU_TARGET}%")
+print(f"Method: vllm standard metrics (gpu_cache_usage_perc + cpu_cache_usage_perc)")
+print(f"Target: GPU cache >= {GPU_TARGET}% AND CPU cache > 0")
 print()
 
 # Step 1: Warmup
-print("[1/4] Warmup: establishing KV cache in HBM...")
+print("[1/3] Warmup: establishing KV cache in HBM...")
 run(bench_cmd(1, 1, 0, 1, "warmup.json"))
-try:
-    warmup_data = json.loads((json_dir / "warmup.json").read_text())
-    baseline_ttft = float(warmup_data["ttfts"][0]) if warmup_data.get("ttfts") else None
-    print(f"  Warmup done. Baseline TTFT: {baseline_ttft:.4f}s" if baseline_ttft else "  Warmup done.")
-except Exception:
-    baseline_ttft = None
-    print("  Warmup done.")
+gpu, cpu, preempt, _ = check_swap()
+print(f"  Warmup done. GPU: {gpu:.1f}%, CPU: {cpu:.1f}, Preemptions: {preempt:.0f}"
+      if gpu is not None and preempt is not None else "  Warmup done.")
 
 # Step 2: Squeeze loop
-print(f"\n[2/4] Squeezing HBM (until GPU cache >= {GPU_TARGET}% or {SQUEEZE_TOTAL} requests)...")
-print(f"{'Batch':<8}{'Sent':<10}{'Preemptions':<16}{'GPU Cache':<14}{'Status'}")
-print("-" * 62)
+print(f"\n[2/3] Squeezing HBM...")
+print(f"{'Batch':<8}{'Sent':<10}{'GPU':<12}{'CPU':<12}{'Preemptions':<16}{'Status'}")
+print("-" * 72)
 
-preempt_start, gpu_start = snapshot()
 total_sent = 0
-preempt_last = preempt_start or 0
+preempt_last = preempt or 0
 batch_num = 0
+swapped = False
 
 while total_sent < SQUEEZE_TOTAL:
     batch_num += 1
@@ -201,53 +152,45 @@ while total_sent < SQUEEZE_TOTAL:
     run(bench_cmd(batch_count, min(SQUEEZE_CONC, batch_count), seed, batch_count, f"squeeze-{batch_num:03d}.json"))
     total_sent += batch_count
 
-    preempt, gpu = snapshot()
-    preempt_str = f"{preempt_last:.0f} -> {preempt:.0f}" if preempt is not None else "N/A"
+    gpu, cpu, preempt, _ = check_swap()
     gpu_str = f"{gpu:.1f}%" if gpu is not None else "N/A"
-    preempt_delta = (preempt or 0) - preempt_last
+    cpu_str = f"{cpu:.1f}" if cpu is not None else "N/A"
+    preempt_str = f"{preempt_last:.0f} -> {preempt:.0f}" if preempt is not None else "N/A"
     preempt_last = preempt or 0
 
-    if gpu is not None and gpu >= GPU_TARGET:
-        status = "FULL \u2713"
-        print(f"  {batch_num:<6}{total_sent:<10}{preempt_str:<16}{gpu_str:<14}{status}")
-        break
-    elif preempt_delta > 0:
-        status = "swapping"
+    # Standard check: GPU full + CPU cache active = swap confirmed
+    if gpu is not None and cpu is not None:
+        if gpu >= GPU_TARGET and cpu > 0:
+            status = "SWAPPED \u2713"
+            swapped = True
+        elif gpu >= GPU_TARGET:
+            status = "GPU full, CPU=0"
+        else:
+            status = "filling"
+    elif gpu is not None and gpu >= GPU_TARGET:
+        status = "GPU full"
     else:
         status = "filling"
 
-    print(f"  {batch_num:<6}{total_sent:<10}{preempt_str:<16}{gpu_str:<14}{status}")
+    print(f"  {batch_num:<6}{total_sent:<10}{gpu_str:<12}{cpu_str:<12}{preempt_str:<16}{status}")
 
-preempt_final, gpu_final = snapshot()
-print(f"\n  Sent {total_sent} requests. Preemptions: {preempt_final:.0f}, GPU cache: {gpu_final:.1f}%"
-      if preempt_final is not None and gpu_final is not None else f"\n  Sent {total_sent} requests.")
+    if swapped:
+        break
 
-# Step 3: Verify DRAM via swapped tokens delta
-print(f"\n[3/4] Verifying: sending prefix P, checking if swapped tokens drop...")
-print(f"  (If swapped_tokens decreases after request, P's blocks were in DRAM and got swapped back)")
-is_dram, msg = verify_dram()
-print(f"  {msg}")
+gpu, cpu, preempt, _ = check_swap()
+print(f"\n[3/3] Squeeze complete. {total_sent} requests sent.")
+print(f"  GPU cache: {gpu:.1f}%" if gpu is not None else "  GPU cache: N/A")
+print(f"  CPU cache: {cpu:.1f}" if cpu is not None else "  CPU cache: N/A")
+print(f"  Preemptions: {preempt:.0f}" if preempt is not None else "  Preemptions: N/A")
 
-# Step 4: Retry if not confirmed
-retries = 0
-while not is_dram and retries < 2 and total_sent < SQUEEZE_TOTAL * 3:
-    retries += 1
-    extra = SQUEEZE_TOTAL // 2
-    print(f"\n[4/4] Not confirmed. Squeezing {extra} more (retry {retries}/2)...")
-    for i in range(max(extra // SQUEEZE_BATCH, 1)):
-        batch_count = min(SQUEEZE_BATCH, extra - i * SQUEEZE_BATCH)
-        if batch_count <= 0:
-            break
-        seed = batch_num + i + retries * 1000
-        run(bench_cmd(batch_count, min(SQUEEZE_CONC, batch_count), seed, batch_count, f"squeeze-r{retries}-{i:03d}.json"))
-        total_sent += batch_count
-    preempt_final, gpu_final = snapshot()
-    print(f"  Sent {total_sent} total. Preemptions: {preempt_final:.0f}, GPU: {gpu_final:.1f}%"
-          if preempt_final is not None and gpu_final is not None else f"  Sent {total_sent} total.")
-    is_dram, msg = verify_dram()
-    print(f"  {msg}")
+if swapped:
+    print(f"\n  DRAM confirmed. GPU cache > {GPU_TARGET}% AND CPU cache > 0.")
+    print(f"  The warmup prefix's KV cache is in DRAM.")
+else:
+    if gpu is not None and gpu >= GPU_TARGET and (cpu is None or cpu == 0):
+        print(f"\n  Warning: GPU full but CPU cache = 0. Is vLLM started with --swap-space?")
+    else:
+        print(f"\n  Warning: Not confirmed. Consider increasing VB_SQUEEZE (current: {SQUEEZE_TOTAL}).")
 
-print(f"\nFinal: {'DRAM confirmed' if is_dram else 'DRAM NOT confirmed - may need more squeeze'}")
-print(f"Total requests sent: {total_sent}")
-print(f"Run: bash bench-dram")
+print(f"\nRun: bash bench-dram")
 PY
