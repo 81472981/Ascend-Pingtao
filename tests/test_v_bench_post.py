@@ -15,6 +15,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "v-bench-post.py"
 C1_SHELL_SCRIPT = REPO_ROOT / "v-bench-post-c1.sh"
+BATCH_SHELL_SCRIPT = REPO_ROOT / "v-bench-post-batch.sh"
 FAKE_VLLM = REPO_ROOT / "tests" / "fake_vllm.py"
 
 
@@ -212,6 +213,42 @@ class VBencPostTest(unittest.TestCase):
                 self.assertIn("prefix_cache", summary_xml)
                 self.assertIn("external_prefix_cache", summary_xml)
                 self.assertIn("0.013", summary_xml)
+
+    def test_batch_shell_script_with_fake_vllm(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "results"
+            env = os.environ.copy()
+            env["VLLM_BIN"] = f"{sys.executable} {FAKE_VLLM}"
+            env["VB_OUT"] = str(output_dir)
+            env["VB_CONCURRENCIES"] = "1,2"
+            env["VB_BATCHES"] = "2"
+            completed = subprocess.run(
+                ["bash", str(BATCH_SHELL_SCRIPT)],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=env,
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+            run_dir = next(output_dir.iterdir())
+            result_path = run_dir / "result_batch.xlsx"
+            self.assertTrue(result_path.is_file())
+            with zipfile.ZipFile(result_path) as archive:
+                workbook_xml = archive.read("xl/workbook.xml").decode()
+                self.assertIn('name="summary"', workbook_xml)
+                self.assertIn('name="c1"', workbook_xml)
+                self.assertIn('name="c2"', workbook_xml)
+                summary_xml = archive.read("xl/worksheets/sheet1.xml").decode()
+                c1_xml = archive.read("xl/worksheets/sheet2.xml").decode()
+                c2_xml = archive.read("xl/worksheets/sheet3.xml").decode()
+                self.assertIn("Avg TTFT", summary_xml)
+                self.assertIn("external_prefix_cache", summary_xml)
+                self.assertIn("request_index", c1_xml)
+                self.assertIn("request_index", c2_xml)
 
 
 if __name__ == "__main__":
