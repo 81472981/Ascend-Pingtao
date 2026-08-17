@@ -13,7 +13,7 @@
 ```bash
 git clone https://github.com/kvcache-ai/Mooncake.git
 cd Mooncake
-pip install -e python/
+pip install -e .
 ```
 
 ### 2. 安装 mooncake-store

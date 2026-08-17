@@ -16,8 +16,8 @@
 git clone https://github.com/kvcache-ai/Mooncake.git
 cd Mooncake
 
-# 仅安装 Python 层（transfer engine 依赖 CUDA，昇腾无法编译）
-pip install -e python/
+# 安装 Python 层（transfer engine 依赖 CUDA，昇腾无法编译）
+pip install -e .
 ```
 
 ## 2. 安装依赖
