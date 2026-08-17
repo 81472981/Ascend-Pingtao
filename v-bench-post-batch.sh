@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 "${PYTHON:-python3}" - <<'PY'
-import json, os, shlex, shutil, statistics, subprocess, sys, urllib.request, zipfile
+import importlib.util, json, os, shlex, shutil, statistics, subprocess, sys, urllib.request, zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -11,6 +11,7 @@ OUTPUT_DIR = Path(os.environ.get("VB_OUT", "vbench-results"))
 INPUT_LEN = 16 * 1024
 BATCHES = int(os.environ.get("VB_BATCHES", "5"))
 CONCURRENCIES = [int(x) for x in os.environ.get("VB_CONCURRENCIES", "1,5,10,100").split(",") if x.strip()]
+_INPUT_TEXT = None
 
 
 def vllm():
@@ -62,6 +63,95 @@ def result_info(path, expected):
             continue
         values.append(float(ttfts[index]))
     return values, len(values), expected - len(values)
+
+
+def first_model():
+    if MODEL:
+        return MODEL
+    try:
+        data = json.loads(
+            urllib.request.urlopen(f"http://{HOST}:{PORT}/v1/models", timeout=2)
+            .read()
+            .decode()
+        )
+        models = data.get("data") or []
+        if models:
+            return models[0].get("id")
+    except Exception:
+        pass
+    return None
+
+
+def generated_prompt():
+    """Return the exact 16K prompt vLLM uses, when importable.
+
+    vllm bench serve does not write prompt text back into its result JSON, so
+    we generate the same deterministic prefix_repetition prompt here.  If vLLM
+    is not importable in this interpreter we fall back to a descriptive label;
+    the benchmark still runs unchanged because it invokes the vllm executable.
+    """
+    global _INPUT_TEXT
+    if _INPUT_TEXT is not None:
+        return _INPUT_TEXT
+    fallback = f"prefix_repetition generated prompt (input_len={INPUT_LEN})"
+    _INPUT_TEXT = fallback
+    if importlib.util.find_spec("vllm") is None:
+        return _INPUT_TEXT
+    try:
+        model_id = first_model()
+        if not model_id:
+            return _INPUT_TEXT
+        from vllm.benchmarks.datasets import PrefixRepetitionRandomDataset
+        from vllm.tokenizers import get_tokenizer
+
+        tokenizer = get_tokenizer(model_id, trust_remote_code=True)
+        dataset = PrefixRepetitionRandomDataset(random_seed=0, disable_shuffle=True)
+        requests = dataset.sample(
+            tokenizer=tokenizer,
+            num_requests=1,
+            prefix_len=INPUT_LEN,
+            suffix_len=0,
+            num_prefixes=1,
+            output_len=1,
+        )
+        if requests:
+            _INPUT_TEXT = requests[0].prompt
+    except Exception:
+        pass
+    return _INPUT_TEXT
+
+
+def request_details(path, expected, stage, concurrency, batch, input_text):
+    """Return one row per requested index, including failures."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    ttfts = data.get("ttfts") or []
+    errors = data.get("errors") or []
+    input_lens = data.get("input_lens") or []
+    output_lens = data.get("output_lens") or []
+    generated_texts = data.get("generated_texts") or []
+    rows = []
+    for index in range(expected):
+        error = errors[index] if index < len(errors) else None
+        raw_ttft = ttfts[index] if index < len(ttfts) else None
+        ttft = float(raw_ttft) if raw_ttft is not None else None
+        success = not error and ttft is not None and ttft >= 0
+        rows.append(
+            [
+                stage,
+                concurrency,
+                batch,
+                index + 1,
+                "success" if success else "failed",
+                ttft if ttft is not None else "",
+                input_lens[index] if index < len(input_lens) else "",
+                output_lens[index] if index < len(output_lens) else "",
+                input_text,
+                generated_texts[index] if index < len(generated_texts) else "",
+                error or "",
+                Path(path).name,
+            ]
+        )
+    return rows
 
 
 def metric_sum(text, name):
@@ -183,6 +273,7 @@ run_dir = OUTPUT_DIR / datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m
 json_dir = run_dir / "json"
 json_dir.mkdir(parents=True, exist_ok=True)
 vllm_bin = vllm()
+input_text = generated_prompt()
 print(f"{'Stage':<16}{'Avg TTFT':<12}{'Success':<10}{'prefix_cache':<16}{'external_prefix_cache':<20}")
 print("-" * 74)
 before = cache_metrics()
@@ -190,6 +281,7 @@ run(command(vllm_bin, json_dir, "warmup.json", 1))
 _, ok, failed = result_info(json_dir / "warmup.json", 1)
 after = cache_metrics()
 print_row("Cache warmup", "-", f"{ok}/{ok + failed}", cache_rates(before, after))
+detail_rows = request_details(json_dir / "warmup.json", 1, "warmup", 1, 0, input_text)
 
 raw_sheets = {}
 summary_rows = [
@@ -219,6 +311,16 @@ for concurrency in CONCURRENCIES:
         after = cache_metrics()
         all_values.extend(values)
         successes.append((ok, failed))
+        detail_rows.extend(
+            request_details(
+                json_dir / filename,
+                concurrency,
+                "benchmark",
+                concurrency,
+                batch,
+                input_text,
+            )
+        )
         rates = cache_rates(before, after)
         batch_rates.append(rates)
         batch_records.append((batch, values, rates))
@@ -267,6 +369,26 @@ for concurrency in CONCURRENCIES:
 
 write_xlsx(
     run_dir / "result_batch.xlsx",
-    {"summary": summary_rows, **raw_sheets},
+    {
+        "summary": summary_rows,
+        **raw_sheets,
+        "request_details": [
+            [
+                "stage",
+                "concurrency",
+                "batch",
+                "request_index",
+                "success",
+                "ttft",
+                "input_tokens",
+                "output_tokens",
+                "input_text",
+                "output_text",
+                "error",
+                "result_file",
+            ],
+            *detail_rows,
+        ],
+    },
 )
 PY

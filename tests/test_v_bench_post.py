@@ -245,10 +245,15 @@ class VBencPostTest(unittest.TestCase):
                 summary_xml = archive.read("xl/worksheets/sheet1.xml").decode()
                 c1_xml = archive.read("xl/worksheets/sheet2.xml").decode()
                 c2_xml = archive.read("xl/worksheets/sheet3.xml").decode()
+                details_xml = archive.read("xl/worksheets/sheet4.xml").decode()
                 self.assertIn("Avg TTFT", summary_xml)
                 self.assertIn("external_prefix_cache", summary_xml)
                 self.assertIn("request_index", c1_xml)
                 self.assertIn("request_index", c2_xml)
+                self.assertIn("request_details", workbook_xml)
+                self.assertIn("<t>input_text</t>", details_xml)
+                self.assertIn("<t>output_text</t>", details_xml)
+                self.assertIn("fake output batch=", details_xml)
 
 
 if __name__ == "__main__":

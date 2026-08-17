@@ -86,6 +86,10 @@ def main() -> None:
         "output_lens": [1] * num_prompts,
         "ttfts": ttfts,
         "itls": [[0.001]] * num_prompts,
+        "generated_texts": [
+            f"fake output batch={batch_number} request={index + 1}"
+            for index in range(num_prompts)
+        ],
         "errors": [""] * num_prompts,
     }
 
