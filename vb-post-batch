@@ -308,30 +308,57 @@ def non_streaming_output(prompt):
     """Get one real non-streaming completion for fallback output text."""
     if not prompt:
         return ""
-    payload = json.dumps(
+    model = SERVED_MODEL_NAME or MODEL or ""
+
+    def first_text(data):
+        choices = data.get("choices") or []
+        if not choices or not isinstance(choices[0], dict):
+            return ""
+        choice = choices[0]
+        text = choice.get("text")
+        if isinstance(text, str) and text:
+            return text
+        message = choice.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, str) and content:
+                return content
+        delta = choice.get("delta")
+        if isinstance(delta, dict):
+            content = delta.get("content")
+            if isinstance(content, str) and content:
+                return content
+        return ""
+
+    payloads = [
         {
-            "model": SERVED_MODEL_NAME or MODEL or "",
+            "model": model,
+            "prompt": prompt,
+            "max_tokens": 1,
+            "temperature": 0,
+        },
+        {
+            "model": model,
             "prompt": prompt,
             "max_tokens": 1,
             "temperature": 0,
             "ignore_eos": True,
         },
-        ensure_ascii=False,
-    ).encode("utf-8")
-    request = urllib.request.Request(
-        f"http://{LLM_HOST}:{LLM_PORT}/v1/completions",
-        data=payload,
-        headers={"Content-Type": "application/json; charset=utf-8"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=1800) as response:
-            data = json.loads(response.read().decode("utf-8"))
-        choices = data.get("choices") or []
-        if choices and isinstance(choices[0], dict):
-            return choices[0].get("text") or ""
-    except Exception:
-        return ""
+    ]
+    for payload in payloads:
+        try:
+            request = urllib.request.Request(
+                f"http://{LLM_HOST}:{LLM_PORT}/v1/completions",
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=1800) as response:
+                text = first_text(json.loads(response.read().decode("utf-8")))
+            if text:
+                return text
+        except Exception:
+            continue
     return ""
 
 
