@@ -273,6 +273,17 @@ def _completion_prompt(body):
     return ""
 
 
+def _completion_model(body):
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    model = data.get("model")
+    return model if isinstance(model, str) else ""
+
+
 def _completion_output(body):
     text = body.decode("utf-8", "replace")
     if "data:" in text:
@@ -304,11 +315,11 @@ def _completion_output(body):
     return ""
 
 
-def non_streaming_output(prompt):
+def non_streaming_output(prompt, model=""):
     """Get one real non-streaming completion for fallback output text."""
     if not prompt:
         return ""
-    model = SERVED_MODEL_NAME or MODEL or ""
+    model = model or SERVED_MODEL_NAME or MODEL or ""
 
     def first_text(data):
         choices = data.get("choices") or []
@@ -393,6 +404,7 @@ class _CaptureProxyHandler(http.server.BaseHTTPRequestHandler):
                         "request_index": request_index,
                         "path": path,
                         "input": _completion_prompt(request_body),
+                        "model": _completion_model(request_body),
                         "output": "",
                         "status": None,
                         "error": "",
@@ -681,11 +693,13 @@ for concurrency in CONCURRENCIES:
         ]
     )
 
-first_captured_input = next(
-    (record.get("input") for record in all_capture_records if record.get("input")),
-    input_text,
+first_captured = next(
+    (record for record in all_capture_records if record.get("input")),
+    {},
 )
-fallback_output = non_streaming_output(first_captured_input or "")
+fallback_prompt = first_captured.get("input") or input_text
+fallback_model = first_captured.get("model") or SERVED_MODEL_NAME or MODEL or ""
+fallback_output = non_streaming_output(fallback_prompt or "", fallback_model)
 if fallback_output:
     for row in detail_rows:
         if not row[9]:
