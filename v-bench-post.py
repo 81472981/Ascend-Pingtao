@@ -299,7 +299,7 @@ def parse_vllm_result(
 
     for index in range(concurrency):
         error = errors[index] if index < len(errors) else None
-        if error is not None:
+        if error:
             failed += 1
             continue
         if index >= len(ttfts):

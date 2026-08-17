@@ -55,7 +55,8 @@ def result_info(path, expected):
     errors = data.get("errors") or []
     values = []
     for index in range(expected):
-        if index < len(errors) and errors[index] is not None:
+        error = errors[index] if index < len(errors) else None
+        if error:
             continue
         if index >= len(ttfts) or ttfts[index] is None:
             continue

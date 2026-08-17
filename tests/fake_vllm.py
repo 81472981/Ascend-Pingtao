@@ -86,7 +86,7 @@ def main() -> None:
         "output_lens": [1] * num_prompts,
         "ttfts": ttfts,
         "itls": [[0.001]] * num_prompts,
-        "errors": [None] * num_prompts,
+        "errors": [""] * num_prompts,
     }
 
     output_path = result_dir / result_filename
