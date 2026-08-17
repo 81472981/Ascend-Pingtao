@@ -12,9 +12,10 @@ VLLM_BIN = os.environ.get("VLLM_BIN", "vllm")
 
 # ====== Config ======
 INPUT_LEN = 16 * 1024
-SQUEEZE_TOTAL = int(os.environ.get("VB_SQUEEZE", "100"))
-SQUEEZE_BATCH = int(os.environ.get("VB_SQUEEZE_BATCH", "10"))   # requests per batch
-SQUEEZE_CONCURRENCY = int(os.environ.get("VB_SQUEEZE_CONC", "10"))
+SQUEEZE_TOTAL = int(os.environ.get("VB_SQUEEZE", "200"))
+SQUEEZE_BATCH = int(os.environ.get("VB_SQUEEZE_BATCH", "10"))
+SQUEEZE_CONC = int(os.environ.get("VB_SQUEEZE_CONC", "10"))
+GPU_TARGET = float(os.environ.get("VB_GPU_TARGET", "95"))
 
 def vllm():
     parts = shlex.split(VLLM_BIN)
@@ -97,6 +98,7 @@ def get_metrics():
 def snapshot():
     m = get_metrics()
     preempt = metric_val(m, "vllm:num_preemptions_total")
+    gpu = None
     for name in ("vllm:gpu_cache_usage_perc", "vllm:gpu_prefix_cache_usage_perc"):
         gpu = metric_val(m, name)
         if gpu is not None:
@@ -111,7 +113,8 @@ json_dir.mkdir(parents=True, exist_ok=True)
 
 print(f"Model: {MODEL}")
 print(f"Input len: {INPUT_LEN} tokens")
-print(f"Squeeze: {SQUEEZE_TOTAL} requests, batch={SQUEEZE_BATCH}, concurrency={SQUEEZE_CONCURRENCY}")
+print(f"Squeeze: up to {SQUEEZE_TOTAL} requests, batch={SQUEEZE_BATCH}, concurrency={SQUEEZE_CONC}")
+print(f"Target: GPU cache >= {GPU_TARGET}%")
 print()
 
 # Step 1: Warmup
@@ -119,22 +122,21 @@ print("[1/3] Warmup: establishing KV cache in HBM...")
 run(bench_cmd(1, 1, 0, 1, "warmup.json"))
 print("  Warmup done.")
 
-# Step 2: Squeeze with real-time monitoring
-print(f"\n[2/3] Squeezing HBM ({SQUEEZE_TOTAL} requests, {SQUEEZE_BATCH}/batch)...")
+# Step 2: Squeeze loop
+print(f"\n[2/3] Squeezing HBM (until GPU cache >= {GPU_TARGET}% or {SQUEEZE_TOTAL} requests)...")
 print(f"{'Batch':<8}{'Sent':<10}{'Preemptions':<16}{'GPU Cache':<14}{'Status'}")
 print("-" * 62)
 
 preempt_start, gpu_start = snapshot()
 total_sent = 0
 preempt_last = preempt_start or 0
-swapped = False
+batch_num = 0
 
-for batch_num in range(1, (SQUEEZE_TOTAL // SQUEEZE_BATCH) + 1):
+while total_sent < SQUEEZE_TOTAL:
+    batch_num += 1
     batch_count = min(SQUEEZE_BATCH, SQUEEZE_TOTAL - total_sent)
-    if batch_count <= 0:
-        break
-    seed = batch_num  # different seed = different prefixes
-    run(bench_cmd(batch_count, min(SQUEEZE_CONCURRENCY, batch_count), seed, batch_count, f"squeeze-{batch_num:03d}.json"))
+    seed = batch_num  # different seed per batch = different prefixes
+    run(bench_cmd(batch_count, min(SQUEEZE_CONC, batch_count), seed, batch_count, f"squeeze-{batch_num:03d}.json"))
     total_sent += batch_count
 
     preempt, gpu = snapshot()
@@ -143,32 +145,24 @@ for batch_num in range(1, (SQUEEZE_TOTAL // SQUEEZE_BATCH) + 1):
     preempt_delta = (preempt or 0) - preempt_last
     preempt_last = preempt or 0
 
-    if preempt_delta > 0 and not swapped:
-        status = "SWAPPED!"
-        swapped = True
-    elif gpu is not None and gpu > 90:
-        status = "HBM nearly full"
-    elif swapped:
-        status = "swapping..."
+    if gpu is not None and gpu >= GPU_TARGET:
+        status = "FULL \u2713"
+        print(f"  {batch_num:<6}{total_sent:<10}{preempt_str:<16}{gpu_str:<14}{status}")
+        break
+    elif preempt_delta > 0:
+        status = "swapping"
     else:
-        status = "filling..."
+        status = "filling"
 
     print(f"  {batch_num:<6}{total_sent:<10}{preempt_str:<16}{gpu_str:<14}{status}")
 
-    if swapped:
-        remaining = SQUEEZE_TOTAL - total_sent
-        if remaining <= 0:
-            break
-        print(f"  KV cache swap detected. Sending {remaining} more to ensure DRAM residence...")
-        # Send remaining in one batch with new prefixes
-        seed = batch_num + 1000
-        run(bench_cmd(remaining, min(SQUEEZE_CONCURRENCY, remaining), seed, remaining, f"squeeze-final.json"))
-        total_sent += remaining
-        break
-
-print(f"\n[3/3] Squeeze complete. {total_sent} requests sent.")
 preempt_final, gpu_final = snapshot()
+print(f"\n[3/3] Squeeze complete. {total_sent} requests sent.")
 print(f"  Final preemptions: {preempt_final:.0f}" if preempt_final is not None else "  Final preemptions: N/A")
 print(f"  GPU cache usage: {gpu_final:.1f}%" if gpu_final is not None else "  GPU cache usage: N/A")
-print(f"\nReady for DRAM benchmark. Run: bash bench-dram")
+if gpu_final is not None and gpu_final >= GPU_TARGET:
+    print(f"  HBM filled to target ({GPU_TARGET}%). Ready for DRAM benchmark.")
+else:
+    print(f"  Warning: HBM not fully filled. Consider increasing VB_SQUEEZE (current: {SQUEEZE_TOTAL}).")
+print(f"\nRun: bash bench-dram")
 PY
