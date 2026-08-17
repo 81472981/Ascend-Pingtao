@@ -16,6 +16,7 @@ SQUEEZE_TOTAL = int(os.environ.get("VB_SQUEEZE", "200"))
 SQUEEZE_BATCH = int(os.environ.get("VB_SQUEEZE_BATCH", "10"))
 SQUEEZE_CONC = int(os.environ.get("VB_SQUEEZE_CONC", "10"))
 GPU_TARGET = float(os.environ.get("VB_GPU_TARGET", "95"))
+DRAM_TTFT_RATIO = float(os.environ.get("VB_DRAM_RATIO", "2.0"))  # TTFT > baseline * ratio -> DRAM
 
 def vllm():
     parts = shlex.split(VLLM_BIN)
@@ -105,6 +106,58 @@ def snapshot():
             break
     return preempt, gpu
 
+def cache_hits_delta(m_before, m_after):
+    """Return (prefix_cache_hits_delta, prefix_cache_queries_delta) or None."""
+    for hit_name, query_name in [
+        ("vllm:prefix_cache_hits_total", "vllm:prefix_cache_queries_total"),
+        ("vllm:prefix_cache_hits", "vllm:prefix_cache_queries"),
+    ]:
+        h1 = metric_val(m_before, hit_name)
+        h2 = metric_val(m_after, hit_name)
+        q1 = metric_val(m_before, query_name)
+        q2 = metric_val(m_after, query_name)
+        if all(v is not None for v in (h1, h2, q1, q2)):
+            return h2 - h1, q2 - q1
+    return None
+
+def verify_dram(baseline_ttft):
+    """Send a test request with warmup prefix (seed=0) and check if it hits DRAM."""
+    m_before = get_metrics()
+    run(bench_cmd(1, 1, 0, 1, "verify.json"))
+    m_after = get_metrics()
+
+    # Read TTFT
+    try:
+        data = json.loads((json_dir / "verify.json").read_text())
+        ttfts = data.get("ttfts") or []
+        ttft = float(ttfts[0]) if ttfts else None
+    except Exception:
+        ttft = None
+
+    # Check prefix cache hits
+    delta = cache_hits_delta(m_before, m_after)
+    if delta:
+        hits_delta, queries_delta = delta
+        cache_info = f"prefix_cache: +{hits_delta:.0f} hits / +{queries_delta:.0f} queries"
+    else:
+        cache_info = "prefix_cache: N/A"
+
+    # Check preemptions
+    preempt_before = metric_val(m_before, "vllm:num_preemptions_total")
+    preempt_after = metric_val(m_after, "vllm:num_preemptions_total")
+    if preempt_before is not None and preempt_after is not None:
+        preempt_info = f"preemptions: {preempt_before:.0f} -> {preempt_after:.0f}"
+    else:
+        preempt_info = "preemptions: N/A"
+
+    if ttft is not None and baseline_ttft is not None and baseline_ttft > 0:
+        ratio = ttft / baseline_ttft
+        if ratio >= DRAM_TTFT_RATIO:
+            return True, f"TTFT {ttft:.4f}s ({ratio:.1f}x baseline) | {cache_info} | {preempt_info}"
+        else:
+            return False, f"TTFT {ttft:.4f}s ({ratio:.1f}x baseline, still in HBM) | {cache_info} | {preempt_info}"
+    return False, f"TTFT N/A | {cache_info} | {preempt_info}"
+
 # --- Main ---
 vllm_bin = vllm()
 discover_model()
@@ -114,16 +167,22 @@ json_dir.mkdir(parents=True, exist_ok=True)
 print(f"Model: {MODEL}")
 print(f"Input len: {INPUT_LEN} tokens")
 print(f"Squeeze: up to {SQUEEZE_TOTAL} requests, batch={SQUEEZE_BATCH}, concurrency={SQUEEZE_CONC}")
-print(f"Target: GPU cache >= {GPU_TARGET}%")
+print(f"Target: GPU cache >= {GPU_TARGET}%, DRAM TTFT >= {DRAM_TTFT_RATIO}x baseline")
 print()
 
-# Step 1: Warmup
-print("[1/3] Warmup: establishing KV cache in HBM...")
+# Step 1: Warmup + baseline TTFT
+print("[1/4] Warmup: establishing KV cache in HBM...")
 run(bench_cmd(1, 1, 0, 1, "warmup.json"))
-print("  Warmup done.")
+try:
+    warmup_data = json.loads((json_dir / "warmup.json").read_text())
+    baseline_ttft = float(warmup_data["ttfts"][0]) if warmup_data.get("ttfts") else None
+    print(f"  Warmup done. Baseline TTFT: {baseline_ttft:.4f}s" if baseline_ttft else "  Warmup done.")
+except Exception:
+    baseline_ttft = None
+    print("  Warmup done.")
 
 # Step 2: Squeeze loop
-print(f"\n[2/3] Squeezing HBM (until GPU cache >= {GPU_TARGET}% or {SQUEEZE_TOTAL} requests)...")
+print(f"\n[2/4] Squeezing HBM (until GPU cache >= {GPU_TARGET}% or {SQUEEZE_TOTAL} requests)...")
 print(f"{'Batch':<8}{'Sent':<10}{'Preemptions':<16}{'GPU Cache':<14}{'Status'}")
 print("-" * 62)
 
@@ -135,7 +194,7 @@ batch_num = 0
 while total_sent < SQUEEZE_TOTAL:
     batch_num += 1
     batch_count = min(SQUEEZE_BATCH, SQUEEZE_TOTAL - total_sent)
-    seed = batch_num  # different seed per batch = different prefixes
+    seed = batch_num
     run(bench_cmd(batch_count, min(SQUEEZE_CONC, batch_count), seed, batch_count, f"squeeze-{batch_num:03d}.json"))
     total_sent += batch_count
 
@@ -157,12 +216,33 @@ while total_sent < SQUEEZE_TOTAL:
     print(f"  {batch_num:<6}{total_sent:<10}{preempt_str:<16}{gpu_str:<14}{status}")
 
 preempt_final, gpu_final = snapshot()
-print(f"\n[3/3] Squeeze complete. {total_sent} requests sent.")
-print(f"  Final preemptions: {preempt_final:.0f}" if preempt_final is not None else "  Final preemptions: N/A")
-print(f"  GPU cache usage: {gpu_final:.1f}%" if gpu_final is not None else "  GPU cache usage: N/A")
-if gpu_final is not None and gpu_final >= GPU_TARGET:
-    print(f"  HBM filled to target ({GPU_TARGET}%). Ready for DRAM benchmark.")
+print(f"\n  Sent {total_sent} requests. Preemptions: {preempt_final:.0f}, GPU cache: {gpu_final:.1f}%"
+      if preempt_final is not None and gpu_final is not None else f"\n  Sent {total_sent} requests.")
+
+# Step 3: Verify DRAM residence
+print(f"\n[3/4] Verifying warmup prefix is in DRAM (TTFT >= {DRAM_TTFT_RATIO}x baseline)...")
+is_dram, msg = verify_dram(baseline_ttft)
+print(f"  {msg}")
+
+# Step 4: If not in DRAM yet, squeeze more
+if not is_dram and total_sent < SQUEEZE_TOTAL * 2:
+    extra = SQUEEZE_TOTAL
+    print(f"\n[4/4] Not in DRAM yet. Sending {extra} more requests...")
+    for i in range(extra // SQUEEZE_BATCH):
+        batch_count = min(SQUEEZE_BATCH, extra - i * SQUEEZE_BATCH)
+        seed = batch_num + i + 1000
+        run(bench_cmd(batch_count, min(SQUEEZE_CONC, batch_count), seed, batch_count, f"squeeze-extra-{i:03d}.json"))
+        total_sent += batch_count
+    preempt_final, gpu_final = snapshot()
+    print(f"  Sent {total_sent} total. Preemptions: {preempt_final:.0f}, GPU: {gpu_final:.1f}%"
+          if preempt_final is not None and gpu_final is not None else f"  Sent {total_sent} total.")
+    print(f"  Re-verifying...")
+    is_dram, msg = verify_dram(baseline_ttft)
+    print(f"  {msg}")
 else:
-    print(f"  Warning: HBM not fully filled. Consider increasing VB_SQUEEZE (current: {SQUEEZE_TOTAL}).")
-print(f"\nRun: bash bench-dram")
+    print(f"\n[4/4] Skipping extra squeeze (already verified or max requests reached).")
+
+print(f"\nFinal: {'DRAM confirmed' if is_dram else 'DRAM NOT confirmed - may need more squeeze'}")
+print(f"Baseline TTFT (HBM): {baseline_ttft:.4f}s" if baseline_ttft else "Baseline TTFT: N/A")
+print(f"Run: bash bench-dram")
 PY
