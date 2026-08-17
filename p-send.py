@@ -14,7 +14,7 @@ from typing import Any
 DEFAULT_PROMPT_PATH = Path("/root/prompts/1.txt")
 DEFAULT_URL = "http://127.0.0.1:8000/v1/completions"
 DEFAULT_METRICS_URL = "http://127.0.0.1:8000/metrics"
-DEFAULT_MODEL = "Qwen3-1.7B"
+DEFAULT_MODEL = "Qwen3-8B"
 
 PREFIX_CACHE_METRIC_PAIRS = (
     ("vllm:prefix_cache_queries_total", "vllm:prefix_cache_hits_total"),

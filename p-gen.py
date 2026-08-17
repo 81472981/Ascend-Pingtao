@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 TARGET_TOKEN_COUNT = 128 * 1024
-DEFAULT_MODEL = "Qwen/Qwen3-1.7B"
+DEFAULT_MODEL = "/mnt/weight/Qwen/Qwen3-1.7B"
 DEFAULT_OUTPUT_DIR = Path("/root/prompts")
 CHINESE_TEXT = (
     "清晨的阳光越过群山照进村庄，人们推开窗户开始新的一天。"
