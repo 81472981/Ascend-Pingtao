@@ -64,6 +64,9 @@ def command(v, result_dir, filename, num_prompts):
 
 def run(cmd):
     result = subprocess.run(cmd, text=True, capture_output=True)
+    if result.stderr.strip():
+        stderr_tail = result.stderr.strip().split("\n")[-5:]
+        print(f"[WARN] vllm stderr:\n" + "\n".join(stderr_tail))
     if result.returncode:
         sys.exit(f"vllm failed: {shlex.join(cmd)}\n{result.stderr[-2000:]}")
 
@@ -471,6 +474,7 @@ class _CaptureProxyHandler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
             response_bytes = bytes(response_body)
         except Exception as error:
+            print(f"[FAIL] proxy forward error: {error}")
             if record_index is not None:
                 with _CAPTURE_LOCK:
                     _CAPTURE_RECORDS[record_index]["status"] = 502
@@ -616,6 +620,8 @@ warmup_captures = take_completion_captures()
 all_capture_records.extend(warmup_captures)
 _, ok, failed = result_info(json_dir / "warmup.json", 1)
 after = cache_metrics()
+if failed > 0:
+    print(f"[FAIL] Cache warmup: {failed} request(s) failed")
 print_row("Cache warmup", "-", f"{ok}/{ok + failed}", cache_rates(before, after))
 detail_rows = request_details(
     json_dir / "warmup.json", 1, "warmup", 1, 0, warmup_captures, input_text
@@ -650,6 +656,8 @@ for concurrency in CONCURRENCIES:
         all_capture_records.extend(captures)
         values, ok, failed = result_info(json_dir / filename, concurrency)
         after = cache_metrics()
+        if failed > 0:
+            print(f"[FAIL] c{concurrency} Batch {batch}/{BATCHES}: {failed} request(s) failed")
         all_values.extend(values)
         successes.append((ok, failed))
         detail_rows.extend(
@@ -672,6 +680,8 @@ for concurrency in CONCURRENCIES:
         sys.exit(f"concurrency {concurrency} has no successful requests")
     total_ok = sum(ok for ok, _ in successes)
     total_failed = sum(failed for _, failed in successes)
+    if total_failed > 0:
+        print(f"[FAIL] c{concurrency}: {total_failed} request(s) failed across all batches")
     success_text = f"{total_ok}/{total_ok + total_failed}"
 
     def average_rate(name):
