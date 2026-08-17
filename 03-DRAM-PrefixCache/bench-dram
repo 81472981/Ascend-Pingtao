@@ -13,9 +13,7 @@ SERVED_MODEL_NAME = os.environ.get("VB_SERVED_MODEL_NAME") or None
 TOKENIZER = os.environ.get("VB_TOKENIZER") or None
 VLLM_BIN = os.environ.get("VLLM_BIN", "vllm")
 OUTPUT_DIR = Path(os.environ.get("VB_OUT", "vbench-results"))
-# ====== Config: modify these as needed ======
 INPUT_LEN = 16 * 1024
-SQUEEZE_COUNT = int(os.environ.get("VB_SQUEEZE", "100"))   # requests to fill HBM
 BATCHES = int(os.environ.get("VB_BATCHES", "5"))
 CONCURRENCIES = [int(x) for x in os.environ.get("VB_CONCURRENCIES", "1,5,10,100").split(",") if x.strip()]
 _INPUT_TEXT = None
@@ -60,31 +58,6 @@ def command(v, result_dir, filename, num_prompts):
     if TOKENIZER:
         extras += ["--tokenizer", TOKENIZER]
     return cmd + extras
-
-def command_squeeze(v, result_dir, filename):
-    """Send many requests with different prefixes to fill HBM and force swap."""
-    cmd = [
-        *v, "bench", "serve", "--host", BENCH_HOST, "--port", str(BENCH_PORT),
-        "--endpoint", "/v1/completions", "--backend", "openai",
-        "--dataset-name", "prefix_repetition", "--num-prompts", str(SQUEEZE_COUNT),
-        "--max-concurrency", "10", "--request-rate", "inf",
-        "--prefix-repetition-prefix-len", str(INPUT_LEN),
-        "--prefix-repetition-suffix-len", "0",
-        "--prefix-repetition-num-prefixes", str(SQUEEZE_COUNT),
-        "--prefix-repetition-output-len", "1", "--seed", "1",
-        "--disable-shuffle", "--temperature", "0", "--ignore-eos",
-        "--save-result", "--save-detailed", "--result-dir", str(result_dir),
-        "--result-filename", filename,
-    ]
-    extras = []
-    if MODEL:
-        extras += ["--model", MODEL]
-    if SERVED_MODEL_NAME:
-        extras += ["--served-model-name", SERVED_MODEL_NAME]
-    if TOKENIZER:
-        extras += ["--tokenizer", TOKENIZER]
-    return cmd + extras
-
 
 def run(cmd):
     result = subprocess.run(cmd, text=True, capture_output=True)
@@ -260,25 +233,6 @@ def cache_metrics():
                 result[name] = (queries, hits)
                 break
     return result
-
-def check_swap(metrics_before, metrics_after):
-    """Check if KV cache was likely swapped to DRAM during squeeze."""
-    indicators = []
-    # Check preemptions (swap events)
-    preempt_name = "vllm:num_preemptions_total"
-    preempt_before = metric_sum(metrics_before, preempt_name)
-    preempt_after = metric_sum(metrics_after, preempt_name)
-    if preempt_before is not None and preempt_after is not None:
-        delta = preempt_after - preempt_before
-        indicators.append(f"preemptions: {preempt_before:.0f} -> {preempt_after:.0f} (+{delta:.0f})")
-    # Check GPU cache usage
-    for name in ("vllm:gpu_cache_usage_perc", "vllm:gpu_prefix_cache_usage_perc"):
-        val = metric_sum(metrics_after, name)
-        if val is not None:
-            indicators.append(f"gpu_cache_usage: {val:.1f}%")
-            break
-    return "; ".join(indicators) if indicators else "no swap metrics available"
-
 
 def cache_rates(before, after):
     rates = {}
@@ -648,29 +602,6 @@ detail_rows = request_details(
     json_dir / "warmup.json", 1, "warmup", 1, 0, warmup_captures, input_text
 )
 
-# --- Squeeze phase: fill HBM to force warmup KV cache to DRAM ---
-print(f"\nSqueezing HBM with {SQUEEZE_COUNT} requests (different prefixes)...")
-metrics_before_squeeze = urllib.request.urlopen(
-    f"http://{HOST}:{PORT}/metrics", timeout=2
-).read().decode()
-begin_capture("squeeze", 1, 0)
-run(command_squeeze(vllm_bin, json_dir, "squeeze.json"))
-squeeze_captures = take_completion_captures()
-all_capture_records.extend(squeeze_captures)
-_, ok, failed = result_info(json_dir / "squeeze.json", SQUEEZE_COUNT)
-if failed > 0:
-    print(f"[FAIL] Squeeze: {failed} request(s) failed")
-metrics_after_squeeze = urllib.request.urlopen(
-    f"http://{HOST}:{PORT}/metrics", timeout=2
-).read().decode()
-swap_info = check_swap(metrics_before_squeeze, metrics_after_squeeze)
-print(f"Squeeze done: {ok}/{ok + failed} successful | {swap_info}")
-detail_rows.extend(
-    request_details(
-        json_dir / "squeeze.json", min(1, len(squeeze_captures)), "squeeze", 1, 0, squeeze_captures, input_text
-    )
-)
-
 raw_sheets = {}
 summary_rows = [
     [
@@ -784,7 +715,7 @@ with (json_dir / "request_details.jsonl").open("w", encoding="utf-8") as detail_
         detail_file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 write_xlsx(
-    run_dir / f"result_batch_dram_{datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d-%H%M%S")}.xlsx",
+    run_dir / f"result_batch_{datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d-%H%M%S")}.xlsx",
     {
         "summary": summary_rows,
         **raw_sheets,

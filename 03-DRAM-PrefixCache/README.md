@@ -23,49 +23,52 @@
 └─────────────────────────────────────────────────┘
 ```
 
-- 通过限制 HBM 中 KV Cache 容量（`--max-model-len` 或 `--gpu-memory-utilization`），迫使新请求的 KV Cache 被 swap 到 DRAM
-- 后续相同 prefix 的请求命中 DRAM 中的 KV Cache，产生额外的数据搬运开销
-- 对比 02 的 HBM 命中，量化 DRAM 命中的 TTFT 增幅
+## 脚本说明
 
-## 测试方案
+测试拆分为两个独立脚本，分步执行：
 
-### 方案 A：Mooncake Store（推荐尝试）
+| 脚本 | 作用 | 执行顺序 |
+|------|------|---------|
+| `squeeze-hbm` | 挤压 HBM，将 KV Cache 换出到 DRAM | 先执行 |
+| `bench-dram` | 在 DRAM 命中场景下跑 TTFT 基准测试 | 后执行 |
 
-使用 Mooncake 的 CPU 内存 Store 作为 KV Cache 后端。
-
-```bash
-vllm serve <model> \
-    --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_both"}' \
-    --port 8000
-```
-
-### 方案 B：vLLM 内置 CPU Offload（兜底）
+### Step 1: squeeze-hbm
 
 ```bash
-vllm serve <model> \
-    --swap-space 16 \
-    --cpu-offload-gb 8 \
-    --max-model-len 32768 \
-    --gpu-memory-utilization 0.85 \
-    --port 8000
+bash squeeze-hbm
 ```
 
-### 测试步骤
+**流程**：
+1. 发送 1 次 warmup 请求（prefix P，16K），建立 KV Cache 在 HBM
+2. 分批发送挤压请求（不同 prefix），每批 10 个，实时监控：
+   - `preemptions`：preemption 次数，>0 表示 KV Cache 开始被换出
+   - `gpu_cache_usage`：HBM 使用率
+3. 检测到 swap 后继续发送剩余请求确保 DRAM 驻留
 
-1. **启动服务**：按方案 A 或 B 启动 vLLM
-2. **冷启动**：发送 1 次 prefix_repetition 请求（16K input），建立 KV Cache
-3. **挤压 HBM**：发送大量不同 prefix 的请求，将 HBM 中的 KV Cache 挤压到 DRAM
-4. **DRAM 命中测试**：使用 `vb-post` 脚本（同 02），发送相同 prefix 请求，记录 TTFT
-5. **对比分析**：将 03 的 TTFT 与 02 的 HBM 基线对比
+**输出示例**：
+```
+Batch   Sent      Preemptions     GPU Cache     Status
+--------------------------------------------------------------
+  1      10       0 -> 0          45.2%         filling...
+  2      20       0 -> 0          68.7%         filling...
+  3      30       0 -> 12         89.3%         SWAPPED!
+  KV cache swap detected. Sending 70 more to ensure DRAM residence...
+```
 
-### 并发测试矩阵
+**可调参数**（环境变量）：
+- `VB_SQUEEZE`：挤压请求总数，默认 100
+- `VB_SQUEEZE_BATCH`：每批请求数，默认 10
+- `VB_SQUEEZE_CONC`：挤压并发数，默认 10
 
-| 并发 | 批次 | 说明 |
-|------|------|------|
-| 1 | 5 | 单请求，DRAM 命中 |
-| 5 | 5 | 5 并发，DRAM 命中 |
-| 10 | 5 | 10 并发，DRAM 命中 |
-| 100 | 5 | 100 并发，DRAM 命中 |
+### Step 2: bench-dram
+
+```bash
+bash bench-dram
+```
+
+**前提**：`squeeze-hbm` 已执行完成，KV Cache 在 DRAM。
+
+**流程**：直接跑并发 1/5/10/100 的 TTFT 基准测试，输出 Excel。
 
 ## 预期结果
 
@@ -78,11 +81,10 @@ vllm serve <model> \
 
 ## 输出物
 
-- `result_c1.xlsx` / `result_batch.xlsx`：与 02 相同格式，含 TTFT 原始数据、汇总、请求明细
-- 对比分析：03 与 02 的 TTFT 差异百分比
+- `bench-dram` 输出：`vbench-results/YYYYMMDD-HHMMSS/result_batch_dram_YYYYMMDD-HHMMSS.xlsx`
+- 含 `summary`、各并发 `raw` sheet、`request_details`
 
 ## 依赖
 
 - 昇腾 910C + vLLM 0.23.0 (Ascend fork)
-- Mooncake SDK（方案 A）或 vLLM 内置 swap（方案 B）
-- 02 文件夹的 `vb-post` / `vb-post-batch` 脚本（可直接复用）
+- vLLM 启动时需配置 swap 空间：`--swap-space 16 --cpu-offload-gb 8`
