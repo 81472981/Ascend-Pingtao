@@ -2,7 +2,18 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-export VB_RUN_DIR="${VB_RUN_DIR:-vbench-results/dram-session}"
+if [[ -z "${VB_RUN_DIR:-}" ]]; then
+  result_root="vb-result"
+  result_stamp="$(date '+%Y-%m-%d %H-%M-%S')"
+  VB_RUN_DIR="$result_root/$result_stamp"
+  result_suffix=2
+  while [[ -e "$VB_RUN_DIR" ]]; do
+    printf -v suffix_text '%02d' "$result_suffix"
+    VB_RUN_DIR="$result_root/$result_stamp-$suffix_text"
+    ((result_suffix += 1))
+  done
+fi
+export VB_RUN_DIR
 export VB_EXPECT_CONCURRENCIES="${VB_EXPECT_CONCURRENCIES:-1,5,10}"
 
 echo "Results from all stages will be written to: $VB_RUN_DIR"

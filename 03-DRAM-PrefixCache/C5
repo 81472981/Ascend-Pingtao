@@ -41,7 +41,16 @@ VLLM_BIN = os.environ.get('VLLM_BIN', 'vllm')
 MODEL = os.environ.get('VB_MODEL') or None
 SERVED_MODEL_NAME = os.environ.get('VB_SERVED_MODEL_NAME') or None
 TOKENIZER = os.environ.get('VB_TOKENIZER') or None
-RUN_DIR = Path(os.environ.get('VB_RUN_DIR', 'vbench-results/dram-session'))
+def default_run_dir():
+    root = Path('vb-result')
+    stamp = datetime.now().strftime('%Y-%m-%d %H-%M-%S')
+    candidate = root / stamp
+    suffix = 2
+    while candidate.exists():
+        candidate = root / f'{stamp}-{suffix:02d}'
+        suffix += 1
+    return candidate
+RUN_DIR = Path(os.environ.get('VB_RUN_DIR') or default_run_dir())
 JSON_DIR = RUN_DIR / 'json' / f'C{CONCURRENCY}'
 RESULT_PATH = RUN_DIR / f'C{CONCURRENCY}-result.json'
 SESSION_PATH = RUN_DIR / 'session.json'
@@ -553,10 +562,9 @@ def rebuild_workbook():
         r2 = values['R2-hbm-cache']['avg_ttft_seconds']
         r3 = values['R3-dram-cache']['avg_ttft_seconds']
         analysis.append([concurrency, r1 if r1 is not None else '', values['R1-warmup']['valid_requests'], r2 if r2 is not None else '', values['R2-hbm-cache']['valid_requests'], r3 if r3 is not None else '', values['R3-dram-cache']['valid_requests'], percent_change(r2, r1), percent_change(r3, r2), percent_change(r3, r1)])
-    sheets = {'summary': summary, **stage_sheets}
+    sheets = {'summary': summary, 'TTFT-analysis': analysis, **stage_sheets}
     sheets['validation'] = validation
     sheets['P1-manifest'] = manifest_rows
-    sheets['TTFT-analysis'] = analysis
     write_xlsx(WORKBOOK_PATH, sheets)
 
 def build_payload(stage_rows, validation_rows):

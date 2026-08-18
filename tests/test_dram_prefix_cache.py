@@ -186,12 +186,12 @@ class DramPrefixCacheTest(unittest.TestCase):
                     names = archive.read("xl/workbook.xml").decode()
                     for sheet in (
                         "summary",
+                        "TTFT-analysis",
                         "R1-warmup",
                         "R2-hbm-cache",
                         "R3-dram-cache",
                         "validation",
                         "P1-manifest",
-                        "TTFT-analysis",
                     ):
                         self.assertIn(f'name="{sheet}"', names)
                 if openpyxl is not None:
@@ -200,12 +200,12 @@ class DramPrefixCacheTest(unittest.TestCase):
                         loaded.sheetnames,
                         [
                             "summary",
+                            "TTFT-analysis",
                             "R1-warmup",
                             "R2-hbm-cache",
                             "R3-dram-cache",
                             "validation",
                             "P1-manifest",
-                            "TTFT-analysis",
                         ],
                     )
                     loaded.close()
@@ -227,6 +227,7 @@ class DramPrefixCacheTest(unittest.TestCase):
                     json.dumps({"enable_ssd_offload": False}), encoding="utf-8"
                 )
                 env = os.environ.copy()
+                env.pop("VB_RUN_DIR", None)
                 env.update(
                     {
                         "VLLM_BIN": f"{sys.executable} {FAKE_VLLM}",
@@ -237,7 +238,6 @@ class DramPrefixCacheTest(unittest.TestCase):
                             "/metrics/summary"
                         ),
                         "MOONCAKE_CONFIG_PATH": str(config),
-                        "VB_RUN_DIR": str(root / "results"),
                         "VB_BATCHES": "1",
                         "VB_STORE_STABLE_SECONDS": "0",
                         "VB_STORE_TIMEOUT_SECONDS": "5",
@@ -249,7 +249,7 @@ class DramPrefixCacheTest(unittest.TestCase):
                     capture_output=True,
                     check=False,
                     env=env,
-                    cwd=REPO_ROOT,
+                    cwd=root,
                     timeout=120,
                 )
                 self.assertEqual(
@@ -258,7 +258,13 @@ class DramPrefixCacheTest(unittest.TestCase):
                     msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
                 )
 
-                result_dir = root / "results"
+                result_roots = list((root / "vb-result").iterdir())
+                self.assertEqual(len(result_roots), 1)
+                self.assertRegex(
+                    result_roots[0].name,
+                    r"^\d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2}(?:-\d{2})?$",
+                )
+                result_dir = result_roots[0]
                 self.assertEqual(
                     {path.name for path in result_dir.glob("C*-result.json")},
                     {"C1-result.json", "C5-result.json", "C10-result.json"},
