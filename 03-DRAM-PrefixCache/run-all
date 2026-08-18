@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+export VB_RUN_DIR="${VB_RUN_DIR:-vbench-results/dram-session}"
+
+echo "Results from all stages will be written to: $VB_RUN_DIR"
+bash "$SCRIPT_DIR/R1-warmup"
+bash "$SCRIPT_DIR/R2-hbm-cache"
+bash "$SCRIPT_DIR/R3-dram-cache"

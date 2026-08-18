@@ -44,6 +44,9 @@ export GLOO_SOCKET_IFNAME=eth0
 export TP_SOCKET_IFNAME=eth0
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10
+# Enable the benchmark-only /reset_prefix_cache endpoint. 03 uses it with
+# reset_connector=false, so only HBM is cleared and Mooncake DRAM is retained.
+export VLLM_SERVER_DEV_MODE=1
 unset ASCEND_ENABLE_USE_FABRIC_MEM
 export MOONCAKE_REQUESTER_LOCAL_HOSTNAME=192.168.243.40
 
