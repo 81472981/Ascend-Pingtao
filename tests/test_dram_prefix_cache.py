@@ -171,9 +171,10 @@ class DramPrefixCacheTest(unittest.TestCase):
                     (result_dir / "C5-result.json").read_text(encoding="utf-8")
                 )
                 for stage in ("R1-warmup", "R2-hbm-cache", "R3-dram-cache"):
-                    self.assertEqual(
-                        payload["stage_summary"][stage]["valid_requests"], 10
-                    )
+                    stage_summary = payload["stage_summary"][stage]
+                    self.assertEqual(stage_summary["successful_requests"], 10)
+                    self.assertEqual(stage_summary["success_rate_percent"], 100)
+                    self.assertEqual(stage_summary["ttft_samples"], 10)
                 r1_hashes = [row[9] for row in payload["stage_rows"]["R1-warmup"]]
                 r2_hashes = [row[9] for row in payload["stage_rows"]["R2-hbm-cache"]]
                 r3_hashes = [row[9] for row in payload["stage_rows"]["R3-dram-cache"]]
@@ -207,6 +208,53 @@ class DramPrefixCacheTest(unittest.TestCase):
                             "validation",
                             "P1-manifest",
                         ],
+                    )
+                    summary_headers = [
+                        cell.value
+                        for cell in next(loaded["summary"].iter_rows(max_row=1))
+                    ]
+                    self.assertEqual(
+                        summary_headers,
+                        [
+                            "stage",
+                            "concurrency",
+                            "successful_requests",
+                            "total_requests",
+                            "success_rate_percent",
+                            "ttft_samples",
+                            "avg_ttft_seconds",
+                            "min_ttft_seconds",
+                            "max_ttft_seconds",
+                        ],
+                    )
+                    analysis_headers = [
+                        cell.value
+                        for cell in next(
+                            loaded["TTFT-analysis"].iter_rows(max_row=1)
+                        )
+                    ]
+                    self.assertEqual(
+                        analysis_headers,
+                        [
+                            "concurrency",
+                            "R1_avg_ttft_seconds",
+                            "R1_success_rate_percent",
+                            "R2_avg_ttft_seconds",
+                            "R2_success_rate_percent",
+                            "R3_avg_ttft_seconds",
+                            "R3_success_rate_percent",
+                            "R2_vs_R1_change_percent",
+                            "R3_vs_R2_change_percent",
+                            "R3_vs_R1_change_percent",
+                        ],
+                    )
+                    forbidden = ("sha", "identity", "validation", "cache")
+                    self.assertFalse(
+                        any(
+                            marker in str(header).lower()
+                            for header in summary_headers + analysis_headers
+                            for marker in forbidden
+                        )
                     )
                     loaded.close()
         finally:

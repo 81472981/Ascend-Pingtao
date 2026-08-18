@@ -544,7 +544,7 @@ def completed_payloads():
 
 def rebuild_workbook():
     payloads = completed_payloads()
-    summary = [['stage', 'concurrency', 'valid_requests', 'expected_requests', 'avg_ttft_seconds', 'min_ttft_seconds', 'max_ttft_seconds']]
+    summary = [['stage', 'concurrency', 'successful_requests', 'total_requests', 'success_rate_percent', 'ttft_samples', 'avg_ttft_seconds', 'min_ttft_seconds', 'max_ttft_seconds']]
     stage_sheets = {stage: [RAW_HEADER] for stage in STAGES}
     validation = [VALIDATION_HEADER]
     for concurrency, payload in payloads.items():
@@ -555,13 +555,13 @@ def rebuild_workbook():
     manifest = load_manifest()
     manifest_rows = [['prompt_id', 'concurrency', 'batch', 'request_index', 'seed', 'input_tokens', 'prompt_sha256', 'token_sha256', 'first_block_sha256']]
     manifest_rows.extend(([item['prompt_id'], item['concurrency'], item['batch'], item['request_index'], item['seed'], item['input_tokens'], item['prompt_sha256'], item['token_sha256'], item['first_block_sha256']] for item in sorted(manifest['requests'].values(), key=lambda value: (value['concurrency'], value['batch'], value['request_index']))))
-    analysis = [['concurrency', 'R1_avg_ttft_seconds', 'R1_valid_requests', 'R2_avg_ttft_seconds', 'R2_valid_requests', 'R3_avg_ttft_seconds', 'R3_valid_requests', 'R2_vs_R1_change_percent', 'R3_vs_R2_change_percent', 'R3_vs_R1_change_percent']]
+    analysis = [['concurrency', 'R1_avg_ttft_seconds', 'R1_success_rate_percent', 'R2_avg_ttft_seconds', 'R2_success_rate_percent', 'R3_avg_ttft_seconds', 'R3_success_rate_percent', 'R2_vs_R1_change_percent', 'R3_vs_R2_change_percent', 'R3_vs_R1_change_percent']]
     for concurrency, payload in payloads.items():
         values = payload['stage_summary']
         r1 = values['R1-warmup']['avg_ttft_seconds']
         r2 = values['R2-hbm-cache']['avg_ttft_seconds']
         r3 = values['R3-dram-cache']['avg_ttft_seconds']
-        analysis.append([concurrency, r1 if r1 is not None else '', values['R1-warmup']['valid_requests'], r2 if r2 is not None else '', values['R2-hbm-cache']['valid_requests'], r3 if r3 is not None else '', values['R3-dram-cache']['valid_requests'], percent_change(r2, r1), percent_change(r3, r2), percent_change(r3, r1)])
+        analysis.append([concurrency, r1 if r1 is not None else '', values['R1-warmup']['success_rate_percent'], r2 if r2 is not None else '', values['R2-hbm-cache']['success_rate_percent'], r3 if r3 is not None else '', values['R3-dram-cache']['success_rate_percent'], percent_change(r2, r1), percent_change(r3, r2), percent_change(r3, r1)])
     sheets = {'summary': summary, 'TTFT-analysis': analysis, **stage_sheets}
     sheets['validation'] = validation
     sheets['P1-manifest'] = manifest_rows
@@ -572,9 +572,11 @@ def build_payload(stage_rows, validation_rows):
     stage_summary = {}
     for stage in STAGES:
         values = [float(row[6]) for row in stage_rows[stage] if row[14] == 'yes' and row[6] != '']
-        item = {'valid_requests': len(values), 'expected_requests': CONCURRENCY * BATCHES, 'avg_ttft_seconds': statistics.fmean(values) if values else None, 'min_ttft_seconds': min(values) if values else None, 'max_ttft_seconds': max(values) if values else None}
+        total = CONCURRENCY * BATCHES
+        successful = sum((1 for row in stage_rows[stage] if row[6] != '' and (not row[15])))
+        item = {'successful_requests': successful, 'total_requests': total, 'success_rate_percent': successful / total * 100 if total else 0, 'ttft_samples': len(values), 'avg_ttft_seconds': statistics.fmean(values) if values else None, 'min_ttft_seconds': min(values) if values else None, 'max_ttft_seconds': max(values) if values else None}
         stage_summary[stage] = item
-        summary_rows.append([stage, CONCURRENCY, item['valid_requests'], item['expected_requests'], item['avg_ttft_seconds'] if item['avg_ttft_seconds'] is not None else '', item['min_ttft_seconds'] if item['min_ttft_seconds'] is not None else '', item['max_ttft_seconds'] if item['max_ttft_seconds'] is not None else ''])
+        summary_rows.append([stage, CONCURRENCY, item['successful_requests'], item['total_requests'], item['success_rate_percent'], item['ttft_samples'], item['avg_ttft_seconds'] if item['avg_ttft_seconds'] is not None else '', item['min_ttft_seconds'] if item['min_ttft_seconds'] is not None else '', item['max_ttft_seconds'] if item['max_ttft_seconds'] is not None else ''])
     return {'created_at': now_cn(), 'concurrency': CONCURRENCY, 'batches': BATCHES, 'input_tokens': INPUT_LEN, 'block_size': BLOCK_SIZE, 'stage_rows': stage_rows, 'validation_rows': validation_rows, 'summary_rows': summary_rows, 'stage_summary': stage_summary}
 
 def clear_generated_session():
