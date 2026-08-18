@@ -1,0 +1,657 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export VB_CONCURRENCY=1
+
+# Readable, self-contained runner. Only Python stdlib is required.
+"${PYTHON:-python3}" - <<'PY'
+import hashlib
+import http.client
+import http.server
+import json
+import os
+import re
+import shlex
+import shutil
+import statistics
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+import zipfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from xml.sax.saxutils import escape
+HOST = os.environ.get('VB_HOST', '127.0.0.1')
+PORT = int(os.environ.get('VB_PORT', '8000'))
+CONCURRENCY = int(os.environ['VB_CONCURRENCY'])
+INPUT_LEN = int(os.environ.get('VB_INPUT_LEN', str(16 * 1024)))
+BLOCK_SIZE = int(os.environ.get('VB_BLOCK_SIZE', '128'))
+BATCHES = int(os.environ.get('VB_BATCHES', '5'))
+BASE_SEED = int(os.environ.get('VB_BASE_SEED', '314159'))
+MIN_HIT_RATE = float(os.environ.get('VB_MIN_HIT_RATE', '0.95'))
+MAX_MISS_RATE = float(os.environ.get('VB_MAX_MISS_RATE', '0.05'))
+STORE_STABLE_SECONDS = float(os.environ.get('VB_STORE_STABLE_SECONDS', '2'))
+STORE_TIMEOUT_SECONDS = float(os.environ.get('VB_STORE_TIMEOUT_SECONDS', '300'))
+STRICT = os.environ.get('VB_STRICT', '1').lower() not in ('0', 'false', 'no')
+NEW_SESSION = os.environ.get('VB_NEW_SESSION', '0').lower() in ('1', 'true', 'yes')
+EXPECTED_CONCURRENCIES = [int(value) for value in os.environ.get('VB_EXPECT_CONCURRENCIES', '1,5,10').split(',') if value.strip()]
+VLLM_BIN = os.environ.get('VLLM_BIN', 'vllm')
+MODEL = os.environ.get('VB_MODEL') or None
+SERVED_MODEL_NAME = os.environ.get('VB_SERVED_MODEL_NAME') or None
+TOKENIZER = os.environ.get('VB_TOKENIZER') or None
+RUN_DIR = Path(os.environ.get('VB_RUN_DIR', 'vbench-results/dram-session'))
+JSON_DIR = RUN_DIR / 'json' / f'C{CONCURRENCY}'
+RESULT_PATH = RUN_DIR / f'C{CONCURRENCY}-result.json'
+SESSION_PATH = RUN_DIR / 'session.json'
+MANIFEST_PATH = RUN_DIR / 'p1-manifest.json'
+PROMPTS_PATH = RUN_DIR / 'p1-prompts.jsonl'
+WORKBOOK_PATH = RUN_DIR / 'dram-cache-benchmark.xlsx'
+MOONCAKE_URL = os.environ.get('VB_MOONCAKE_METRICS_URL', 'http://127.0.0.1:9003/metrics/summary')
+MOONCAKE_CONFIG = Path(os.environ.get('MOONCAKE_CONFIG_PATH', '/tmp/mooncake.json'))
+XML_INVALID = re.compile('[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\uFFFE\\uFFFF]')
+STAGES = ('R1-warmup', 'R2-hbm-cache', 'R3-dram-cache')
+if CONCURRENCY <= 0 or BATCHES <= 0:
+    sys.exit('VB_CONCURRENCY and VB_BATCHES must be positive integers')
+if INPUT_LEN <= 0 or BLOCK_SIZE <= 0 or INPUT_LEN % BLOCK_SIZE:
+    sys.exit('VB_INPUT_LEN must be positive and divisible by VB_BLOCK_SIZE')
+CACHE_PAIRS = {'local': (('vllm:prefix_cache_queries_total', 'vllm:prefix_cache_hits_total'), ('vllm:prefix_cache_queries', 'vllm:prefix_cache_hits')), 'external': (('vllm:external_prefix_cache_queries_total', 'vllm:external_prefix_cache_hits_total'), ('vllm:external_prefix_cache_queries', 'vllm:external_prefix_cache_hits'))}
+CAPTURE_LOCK = threading.Lock()
+CAPTURE_RECORDS = []
+CAPTURE_PREFIX = ''
+BENCH_HOST = HOST
+BENCH_PORT = PORT
+
+def now_cn():
+    return datetime.now(timezone(timedelta(hours=8))).isoformat()
+
+def fetch(url, timeout=10):
+    return urllib.request.urlopen(url, timeout=timeout).read().decode('utf-8', 'replace')
+
+def post_json(url, payload, timeout=120):
+    request = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode('utf-8'), headers={'Content-Type': 'application/json; charset=utf-8'}, method='POST')
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return (response.status, json.loads(response.read().decode('utf-8')))
+
+def model_info():
+    try:
+        data = json.loads(fetch(f'http://{HOST}:{PORT}/v1/models'))
+        item = (data.get('data') or [])[0]
+        return (item.get('id'), item.get('root'))
+    except Exception:
+        return (None, None)
+
+def discover_model():
+    global MODEL, SERVED_MODEL_NAME, TOKENIZER
+    served, root = model_info()
+    MODEL = MODEL or root or served
+    SERVED_MODEL_NAME = SERVED_MODEL_NAME or served or MODEL
+    if TOKENIZER is None and MODEL and Path(MODEL).expanduser().is_dir():
+        TOKENIZER = str(Path(MODEL).expanduser())
+    if not MODEL:
+        sys.exit('cannot discover model; set VB_MODEL and VB_SERVED_MODEL_NAME')
+
+def vllm_command():
+    parts = shlex.split(VLLM_BIN)
+    executable = parts[0]
+    if not os.path.dirname(executable) and shutil.which(executable) is None:
+        candidate = Path('.venv/bin') / executable
+        if candidate.is_file():
+            parts[0] = str(candidate.resolve())
+        else:
+            sys.exit(f'vllm not found: {executable}')
+    elif os.path.dirname(executable) and (not Path(executable).is_file()):
+        sys.exit(f'vllm not found: {executable}')
+    return parts
+
+def metric_sum(text, name):
+    values = []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0].split('{', 1)[0] == name:
+            try:
+                values.append(float(fields[1]))
+            except ValueError:
+                pass
+    return sum(values) if values else None
+
+def cache_metrics():
+    try:
+        text = fetch(f'http://{HOST}:{PORT}/metrics')
+    except Exception:
+        return {name: None for name in CACHE_PAIRS}
+    result = {}
+    for label, pairs in CACHE_PAIRS.items():
+        result[label] = None
+        for query_name, hit_name in pairs:
+            queries = metric_sum(text, query_name)
+            hits = metric_sum(text, hit_name)
+            if queries is not None and hits is not None:
+                result[label] = (queries, hits)
+                break
+    return result
+
+def cache_delta(before, after):
+    result = {}
+    for label in CACHE_PAIRS:
+        first, last = (before.get(label), after.get(label))
+        if first is None or last is None:
+            result[label] = None
+            continue
+        queries = last[0] - first[0]
+        hits = last[1] - first[1]
+        result[label] = {'queries': queries, 'hits': hits, 'rate': hits / queries if queries > 0 else None}
+    return result
+
+def rate_text(value):
+    return f'{value:.2%}' if value is not None else 'N/A'
+
+def mooncake_summary():
+    try:
+        return fetch(MOONCAKE_URL).strip()
+    except Exception:
+        return ''
+
+def mooncake_keys(summary=None):
+    summary = mooncake_summary() if summary is None else summary
+    match = re.search('Keys:\\s*(\\d+)', summary, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+def reset_local(label):
+    before = mooncake_keys()
+    url = f'http://{HOST}:{PORT}/reset_prefix_cache?reset_running_requests=false&reset_connector=false'
+    request = urllib.request.Request(url, data=b'', method='POST')
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = response.read().decode('utf-8', 'replace').strip()
+            if response.status != 200 or body.lower() in ('false', '0'):
+                raise RuntimeError(f'HTTP {response.status}: {body}')
+    except Exception as error:
+        raise RuntimeError('local cache reset failed; start vLLM with VLLM_SERVER_DEV_MODE=1') from error
+    after = mooncake_keys()
+    if before is not None and after != before:
+        raise RuntimeError(f'Mooncake Keys changed during {label}: {before} -> {after}')
+    return f'{label}: HTTP 200; Mooncake Keys {before} -> {after}'
+
+def wait_mooncake_settle(keys_before):
+    deadline = time.monotonic() + STORE_TIMEOUT_SECONDS
+    last_keys = None
+    stable_since = None
+    while time.monotonic() < deadline:
+        current = mooncake_keys()
+        grew = current is not None and (keys_before is None or current > keys_before)
+        if grew and current == last_keys:
+            if stable_since is None:
+                stable_since = time.monotonic()
+            if time.monotonic() - stable_since >= STORE_STABLE_SECONDS:
+                return current
+        else:
+            stable_since = None
+        last_keys = current
+        time.sleep(0.5)
+    raise RuntimeError(f'Mooncake store did not become stable within {STORE_TIMEOUT_SECONDS:g}s; Keys {keys_before} -> {last_keys}')
+
+def completion_prompt(body):
+    try:
+        data = json.loads(body.decode('utf-8'))
+    except Exception:
+        return ''
+    prompt = data.get('prompt') if isinstance(data, dict) else None
+    if isinstance(prompt, str):
+        return prompt
+    if isinstance(prompt, list):
+        return json.dumps(prompt, ensure_ascii=False, separators=(',', ':'))
+    return ''
+
+class CaptureProxyHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _handle(self):
+        length = int(self.headers.get('Content-Length', '0') or 0)
+        request_body = self.rfile.read(length) if length else b''
+        path = self.path.split('?', 1)[0]
+        request_id = self.headers.get('x-request-id', '')
+        record = None
+        if self.command == 'POST' and path.endswith('/v1/completions') and request_id.startswith(CAPTURE_PREFIX):
+            record = {'request_id': request_id, 'prompt': completion_prompt(request_body), 'status': None, 'error': ''}
+            with CAPTURE_LOCK:
+                CAPTURE_RECORDS.append(record)
+        connection = http.client.HTTPConnection(HOST, PORT, timeout=1800)
+        headers = {}
+        for key, value in self.headers.items():
+            if key.lower() in ('host', 'content-length', 'connection', 'accept-encoding'):
+                continue
+            headers[key] = value
+        headers['Host'] = f'{HOST}:{PORT}'
+        try:
+            connection.request(self.command, self.path, body=request_body, headers=headers)
+            upstream = connection.getresponse()
+            self.send_response(upstream.status)
+            for key, value in upstream.getheaders():
+                if key.lower() in ('content-length', 'transfer-encoding', 'connection', 'keep-alive'):
+                    continue
+                self.send_header(key, value)
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            while True:
+                chunk = upstream.read1(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+            self.close_connection = True
+            if record is not None:
+                record['status'] = upstream.status
+        except Exception as error:
+            if record is not None:
+                record['status'] = 502
+                record['error'] = str(error)
+            try:
+                self.send_response(502)
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                self.wfile.write(str(error).encode('utf-8', 'replace'))
+            except Exception:
+                pass
+        finally:
+            connection.close()
+
+    def do_GET(self):
+        self._handle()
+
+    def do_POST(self):
+        self._handle()
+
+def start_capture_proxy():
+    global BENCH_HOST, BENCH_PORT
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), CaptureProxyHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    BENCH_HOST = '127.0.0.1'
+    BENCH_PORT = server.server_address[1]
+    return server
+
+def begin_capture(prefix):
+    global CAPTURE_PREFIX
+    with CAPTURE_LOCK:
+        CAPTURE_RECORDS.clear()
+        CAPTURE_PREFIX = prefix
+
+def captured_prompts(prefix, expected):
+    with CAPTURE_LOCK:
+        records = [dict(item) for item in CAPTURE_RECORDS]
+    indexed = []
+    for record in records:
+        suffix = record['request_id'][len(prefix):]
+        if not suffix.isdigit():
+            raise RuntimeError(f"unexpected x-request-id: {record['request_id']}")
+        indexed.append((int(suffix), record))
+    indexed.sort(key=lambda item: item[0])
+    indexes = [item[0] for item in indexed]
+    if len(indexed) != expected or len(set(indexes)) != expected:
+        raise RuntimeError(f'captured {len(indexed)}/{expected} uniquely indexed completion requests')
+    if indexes != list(range(indexes[0], indexes[0] + expected)):
+        raise RuntimeError(f'non-contiguous request indexes: {indexes}')
+    return [item[1] for item in indexed]
+
+def prompt_sha(prompt):
+    return hashlib.sha256(prompt.encode('utf-8')).hexdigest()
+
+def token_sha(tokens):
+    raw = json.dumps(tokens, separators=(',', ':')).encode('ascii')
+    return hashlib.sha256(raw).hexdigest()
+
+def tokenize_prompt(prompt):
+    status, data = post_json(f'http://{HOST}:{PORT}/tokenize', {'model': SERVED_MODEL_NAME, 'prompt': prompt, 'add_special_tokens': False}, timeout=300)
+    tokens = data.get('tokens') if isinstance(data, dict) else None
+    if status != 200 or not isinstance(tokens, list):
+        raise RuntimeError('/tokenize did not return a token list')
+    return tokens
+
+def seed_for(batch):
+    return BASE_SEED + CONCURRENCY * 10000 + batch
+
+def benchmark_command(vllm, stage, batch, seed, filename, request_prefix):
+    command = [*vllm, 'bench', 'serve', '--host', BENCH_HOST, '--port', str(BENCH_PORT), '--endpoint', '/v1/completions', '--backend', 'openai', '--dataset-name', 'prefix_repetition', '--num-prompts', str(CONCURRENCY), '--max-concurrency', str(CONCURRENCY), '--request-rate', 'inf', '--prefix-repetition-prefix-len', str(INPUT_LEN), '--prefix-repetition-suffix-len', '0', '--prefix-repetition-num-prefixes', str(CONCURRENCY), '--prefix-repetition-output-len', '1', '--seed', str(seed), '--disable-shuffle', '--temperature', '0', '--ignore-eos', '--num-warmups', '0', '--ready-check-timeout-sec', '0', '--request-id-prefix', request_prefix, '--disable-tqdm', '--save-result', '--save-detailed', '--result-dir', str(JSON_DIR / stage), '--result-filename', filename]
+    if MODEL:
+        command += ['--model', MODEL]
+    if SERVED_MODEL_NAME:
+        command += ['--served-model-name', SERVED_MODEL_NAME]
+    if TOKENIZER:
+        command += ['--tokenizer', TOKENIZER]
+    return command
+
+def run_command(command):
+    result = subprocess.run(command, text=True, capture_output=True)
+    if result.returncode:
+        raise RuntimeError(f'vllm bench failed: {shlex.join(command)}\nstdout:\n{result.stdout[-2000:]}\nstderr:\n{result.stderr[-4000:]}')
+
+def source_name(delta):
+    local = delta['local'] and delta['local']['rate']
+    external = delta['external'] and delta['external']['rate']
+    if local is not None and local >= MIN_HIT_RATE:
+        return 'HBM'
+    if external is not None and external >= MIN_HIT_RATE:
+        return 'DRAM'
+    return 'MISS_OR_MIXED'
+
+def cache_valid(stage, delta):
+    local = delta['local'] and delta['local']['rate']
+    external = delta['external'] and delta['external']['rate']
+    if local is None or external is None:
+        return (False, 'cache counters unavailable')
+    if stage == 'R1-warmup':
+        valid = local <= MAX_MISS_RATE and external <= MAX_MISS_RATE
+        reason = f'local={rate_text(local)}, external={rate_text(external)}; both required <= {MAX_MISS_RATE:.0%}'
+        return (valid, reason)
+    if stage == 'R2-hbm-cache':
+        valid = local >= MIN_HIT_RATE
+        return (valid, f'local={rate_text(local)}, required >= {MIN_HIT_RATE:.0%}')
+    valid = local <= MAX_MISS_RATE and external >= MIN_HIT_RATE
+    reason = f'local={rate_text(local)} (<= {MAX_MISS_RATE:.0%}), external={rate_text(external)} (>= {MIN_HIT_RATE:.0%})'
+    return (valid, reason)
+
+def load_manifest():
+    if MANIFEST_PATH.is_file():
+        return json.loads(MANIFEST_PATH.read_text(encoding='utf-8'))
+    return {'version': 1, 'input_tokens': INPUT_LEN, 'block_size': BLOCK_SIZE, 'requests': {}}
+
+def save_manifest(manifest):
+    temporary = MANIFEST_PATH.with_suffix('.json.tmp')
+    temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+    temporary.replace(MANIFEST_PATH)
+
+def add_manifest_batch(manifest, batch, seed, captures):
+    requests = manifest['requests']
+    existing_full = {entry['prompt_sha256'] for entry in requests.values()}
+    existing_first = {entry['first_block_sha256'] for entry in requests.values()}
+    additions = []
+    for index, capture in enumerate(captures, 1):
+        prompt_id = f'C{CONCURRENCY}-B{batch}-Q{index}'
+        if prompt_id in requests:
+            raise RuntimeError(f'{prompt_id} already exists; restart vLLM/Mooncake for a new cold run')
+        prompt = capture['prompt']
+        tokens = tokenize_prompt(prompt)
+        if len(tokens) != INPUT_LEN:
+            raise RuntimeError(f'{prompt_id} has {len(tokens)} tokens, expected {INPUT_LEN}')
+        full_hash = prompt_sha(prompt)
+        all_token_hash = token_sha(tokens)
+        first_hash = token_sha(tokens[:BLOCK_SIZE])
+        if full_hash in existing_full:
+            raise RuntimeError(f'duplicate full prompt detected: {prompt_id}')
+        if first_hash in existing_first:
+            raise RuntimeError(f'duplicate first {BLOCK_SIZE}-token block: {prompt_id}')
+        entry = {'prompt_id': prompt_id, 'concurrency': CONCURRENCY, 'batch': batch, 'request_index': index, 'seed': seed, 'input_tokens': len(tokens), 'prompt_sha256': full_hash, 'token_sha256': all_token_hash, 'first_block_sha256': first_hash}
+        additions.append((entry, prompt))
+        existing_full.add(full_hash)
+        existing_first.add(first_hash)
+    for entry, _ in additions:
+        requests[entry['prompt_id']] = entry
+    save_manifest(manifest)
+    with PROMPTS_PATH.open('a', encoding='utf-8') as prompt_file:
+        for entry, prompt in additions:
+            prompt_file.write(json.dumps({'prompt_id': entry['prompt_id'], 'prompt': prompt}, ensure_ascii=False) + '\n')
+    return [entry for entry, _ in additions]
+
+def stage_prompt_hashes(captures):
+    return [prompt_sha(capture['prompt']) for capture in captures]
+
+def result_arrays(data):
+    ttfts = data.get('ttfts') or []
+    errors = data.get('errors') or []
+    completed = sum((1 for index in range(CONCURRENCY) if index < len(ttfts) and ttfts[index] is not None and (not (errors[index] if index < len(errors) else None))))
+    return (completed, CONCURRENCY - completed)
+
+def run_stage(vllm, stage, batch, seed, expected_entries, reset_evidence=''):
+    stage_slug = stage.split('-', 1)[0].lower()
+    request_prefix = f'p1-c{CONCURRENCY}-b{batch}-{stage_slug}-'
+    filename = f'c{CONCURRENCY:03d}-b{batch:02d}-{stage_slug}.json'
+    output_path = JSON_DIR / stage / filename
+    (JSON_DIR / stage).mkdir(parents=True, exist_ok=True)
+    begin_capture(request_prefix)
+    before = cache_metrics()
+    run_command(benchmark_command(vllm, stage, batch, seed, filename, request_prefix))
+    after = cache_metrics()
+    data = json.loads(output_path.read_text(encoding='utf-8'))
+    captures = captured_prompts(request_prefix, CONCURRENCY)
+    delta = cache_delta(before, after)
+    completed, failed = result_arrays(data)
+    hashes = stage_prompt_hashes(captures)
+    input_lens = data.get('input_lens') or []
+    input_valid = len(input_lens) >= CONCURRENCY and all((input_lens[index] == INPUT_LEN for index in range(CONCURRENCY)))
+    if expected_entries is None:
+        identity_valid = len(hashes) == len(set(hashes)) == CONCURRENCY
+    else:
+        identity_valid = hashes == [item['prompt_sha256'] for item in expected_entries]
+    successful = completed == CONCURRENCY
+    cache_ok, cache_reason = cache_valid(stage, delta)
+    valid = successful and input_valid and identity_valid and cache_ok
+    reason_parts = [cache_reason]
+    if not successful:
+        reason_parts.append(f'request success {completed}/{CONCURRENCY}')
+    if not input_valid:
+        reason_parts.append(f'not all input_lens are {INPUT_LEN}')
+    if not identity_valid:
+        reason_parts.append('prompt hashes do not match the fixed batch P1')
+    source = source_name(delta)
+    return {'stage': stage, 'batch': batch, 'seed': seed, 'filename': filename, 'data': data, 'captures': captures, 'hashes': hashes, 'delta': delta, 'completed': completed, 'failed': failed, 'input_valid': input_valid, 'identity_valid': identity_valid, 'source': source, 'valid': valid, 'reason': '; '.join(reason_parts), 'reset_evidence': reset_evidence}
+
+def raw_rows_for(stage_result, entries):
+    data = stage_result['data']
+    ttfts = data.get('ttfts') or []
+    errors = data.get('errors') or []
+    input_lens = data.get('input_lens') or []
+    output_lens = data.get('output_lens') or []
+    generated = data.get('generated_texts') or []
+    rows = []
+    for index, entry in enumerate(entries):
+        error = errors[index] if index < len(errors) else 'missing result'
+        ttft = ttfts[index] if index < len(ttfts) else None
+        request_valid = stage_result['valid'] and ttft is not None and (not error)
+        rows.append([stage_result['stage'], CONCURRENCY, stage_result['batch'], entry['prompt_id'], index + 1, stage_result['seed'], float(ttft) if ttft is not None else '', input_lens[index] if index < len(input_lens) else '', output_lens[index] if index < len(output_lens) else '', entry['prompt_sha256'], entry['token_sha256'], entry['first_block_sha256'], generated[index] if index < len(generated) else '', stage_result['source'], 'yes' if request_valid else 'no', error or '', stage_result['filename']])
+    return rows
+
+def validation_row(stage_result):
+    local = stage_result['delta']['local']
+    external = stage_result['delta']['external']
+    return [CONCURRENCY, stage_result['batch'], stage_result['stage'], stage_result['completed'], stage_result['failed'], 'yes' if stage_result['identity_valid'] else 'no', 'yes' if stage_result['input_valid'] else 'no', local['queries'] if local else '', local['hits'] if local else '', rate_text(local['rate'] if local else None), external['queries'] if external else '', external['hits'] if external else '', rate_text(external['rate'] if external else None), stage_result['source'], 'yes' if stage_result['valid'] else 'no', stage_result['reason'], stage_result['reset_evidence']]
+RAW_HEADER = ['stage', 'concurrency', 'batch', 'prompt_id', 'request_index', 'seed', 'ttft_seconds', 'input_tokens', 'output_tokens', 'prompt_sha256', 'token_sha256', 'first_block_sha256', 'output_text', 'source', 'valid_request', 'error', 'result_file']
+VALIDATION_HEADER = ['concurrency', 'batch', 'stage', 'completed', 'failed', 'prompt_identity_valid', 'input_length_valid', 'local_queries', 'local_hits', 'local_rate', 'external_queries', 'external_hits', 'external_rate', 'source', 'valid_batch', 'reason', 'reset_evidence']
+
+def col_name(index):
+    name = ''
+    while index >= 0:
+        name = chr(65 + index % 26) + name
+        index = index // 26 - 1
+    return name
+
+def sheet_xml(rows):
+    body = []
+    for row_number, row in enumerate(rows, 1):
+        cells = []
+        for column_number, value in enumerate(row):
+            reference = f'{col_name(column_number)}{row_number}'
+            if isinstance(value, (int, float)) and (not isinstance(value, bool)):
+                cells.append(f'<c r="{reference}"><v>{value}</v></c>')
+            else:
+                text = escape(XML_INVALID.sub('', str(value)))
+                cells.append(f'<c r="{reference}" t="inlineStr"><is><t>{text}</t></is></c>')
+        body.append(f'''<row r="{row_number}">{''.join(cells)}</row>''')
+    last_column = col_name(max((len(row) for row in rows), default=1) - 1)
+    last_row = max(len(rows), 1)
+    return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:{last_column}{last_row}"/><sheetData>{''.join(body)}</sheetData></worksheet>"""
+
+def write_xlsx(path, sheets):
+    content = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+    relationships = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    sheet_tags = ''
+    for index, name in enumerate(sheets, 1):
+        content += f'<Override PartName="/xl/worksheets/sheet{index}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        relationships += f'<Relationship Id="rId{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{index}.xml"/>'
+        sheet_tags += f'<sheet name="{escape(name)}" sheetId="{index}" r:id="rId{index}"/>'
+    content += '</Types>'
+    relationships += '</Relationships>'
+    workbook = f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>{sheet_tags}</sheets></workbook>'
+    root_relationships = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'
+    with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr('[Content_Types].xml', content)
+        archive.writestr('_rels/.rels', root_relationships)
+        archive.writestr('xl/workbook.xml', workbook)
+        archive.writestr('xl/_rels/workbook.xml.rels', relationships)
+        for index, rows in enumerate(sheets.values(), 1):
+            archive.writestr(f'xl/worksheets/sheet{index}.xml', sheet_xml(rows))
+
+def percent_change(current, baseline):
+    if current is None or baseline in (None, 0):
+        return ''
+    return (current / baseline - 1) * 100
+
+def completed_payloads():
+    payloads = {}
+    for path in RUN_DIR.glob('C*-result.json'):
+        try:
+            payload = json.loads(path.read_text(encoding='utf-8'))
+            payloads[int(payload['concurrency'])] = payload
+        except Exception as error:
+            raise RuntimeError(f'invalid result file {path}: {error}') from error
+    return dict(sorted(payloads.items()))
+
+def rebuild_workbook():
+    payloads = completed_payloads()
+    summary = [['stage', 'concurrency', 'valid_requests', 'expected_requests', 'avg_ttft_seconds', 'min_ttft_seconds', 'max_ttft_seconds']]
+    stage_sheets = {stage: [RAW_HEADER] for stage in STAGES}
+    validation = [VALIDATION_HEADER]
+    for concurrency, payload in payloads.items():
+        summary.extend(payload['summary_rows'])
+        for stage in STAGES:
+            stage_sheets[stage].extend(payload['stage_rows'].get(stage, []))
+        validation.extend(payload['validation_rows'])
+    manifest = load_manifest()
+    manifest_rows = [['prompt_id', 'concurrency', 'batch', 'request_index', 'seed', 'input_tokens', 'prompt_sha256', 'token_sha256', 'first_block_sha256']]
+    manifest_rows.extend(([item['prompt_id'], item['concurrency'], item['batch'], item['request_index'], item['seed'], item['input_tokens'], item['prompt_sha256'], item['token_sha256'], item['first_block_sha256']] for item in sorted(manifest['requests'].values(), key=lambda value: (value['concurrency'], value['batch'], value['request_index']))))
+    analysis = [['concurrency', 'R1_avg_ttft_seconds', 'R1_valid_requests', 'R2_avg_ttft_seconds', 'R2_valid_requests', 'R3_avg_ttft_seconds', 'R3_valid_requests', 'R2_vs_R1_change_percent', 'R3_vs_R2_change_percent', 'R3_vs_R1_change_percent']]
+    for concurrency, payload in payloads.items():
+        values = payload['stage_summary']
+        r1 = values['R1-warmup']['avg_ttft_seconds']
+        r2 = values['R2-hbm-cache']['avg_ttft_seconds']
+        r3 = values['R3-dram-cache']['avg_ttft_seconds']
+        analysis.append([concurrency, r1 if r1 is not None else '', values['R1-warmup']['valid_requests'], r2 if r2 is not None else '', values['R2-hbm-cache']['valid_requests'], r3 if r3 is not None else '', values['R3-dram-cache']['valid_requests'], percent_change(r2, r1), percent_change(r3, r2), percent_change(r3, r1)])
+    sheets = {'summary': summary, **stage_sheets}
+    sheets['validation'] = validation
+    sheets['P1-manifest'] = manifest_rows
+    sheets['TTFT-analysis'] = analysis
+    write_xlsx(WORKBOOK_PATH, sheets)
+
+def build_payload(stage_rows, validation_rows):
+    summary_rows = []
+    stage_summary = {}
+    for stage in STAGES:
+        values = [float(row[6]) for row in stage_rows[stage] if row[14] == 'yes' and row[6] != '']
+        item = {'valid_requests': len(values), 'expected_requests': CONCURRENCY * BATCHES, 'avg_ttft_seconds': statistics.fmean(values) if values else None, 'min_ttft_seconds': min(values) if values else None, 'max_ttft_seconds': max(values) if values else None}
+        stage_summary[stage] = item
+        summary_rows.append([stage, CONCURRENCY, item['valid_requests'], item['expected_requests'], item['avg_ttft_seconds'] if item['avg_ttft_seconds'] is not None else '', item['min_ttft_seconds'] if item['min_ttft_seconds'] is not None else '', item['max_ttft_seconds'] if item['max_ttft_seconds'] is not None else ''])
+    return {'created_at': now_cn(), 'concurrency': CONCURRENCY, 'batches': BATCHES, 'input_tokens': INPUT_LEN, 'block_size': BLOCK_SIZE, 'stage_rows': stage_rows, 'validation_rows': validation_rows, 'summary_rows': summary_rows, 'stage_summary': stage_summary}
+
+def clear_generated_session():
+    if JSON_DIR.parent.is_dir():
+        shutil.rmtree(JSON_DIR.parent)
+    for path in RUN_DIR.glob('C*-result.json'):
+        path.unlink()
+    for path in (SESSION_PATH, MANIFEST_PATH, PROMPTS_PATH, WORKBOOK_PATH):
+        path.unlink(missing_ok=True)
+
+def prepare_session():
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    keys = mooncake_keys()
+    if keys is None and STRICT:
+        sys.exit(f'cannot read Mooncake Keys from {MOONCAKE_URL}')
+    if NEW_SESSION:
+        if keys not in (None, 0):
+            sys.exit(f'new session requires empty Mooncake, but Keys={keys}; restart vLLM/Mooncake')
+        clear_generated_session()
+    if SESSION_PATH.is_file():
+        session = json.loads(SESSION_PATH.read_text(encoding='utf-8'))
+        if session.get('model') != MODEL or session.get('input_tokens') != INPUT_LEN:
+            sys.exit('existing VB_RUN_DIR belongs to a different model/input length')
+        if RESULT_PATH.is_file():
+            sys.exit(f'{RESULT_PATH} already exists; R1 cannot be repeated cold without restarting vLLM/Mooncake and using a new session')
+        if session.get('completed_concurrencies') and keys in (None, 0):
+            sys.exit('Mooncake is empty but this session already has results; start a new session')
+        return session
+    if keys not in (None, 0):
+        sys.exit(f'first concurrency requires empty Mooncake, but Keys={keys}; restart vLLM/Mooncake')
+    session = {'created_at': now_cn(), 'model': MODEL, 'served_model_name': SERVED_MODEL_NAME, 'input_tokens': INPUT_LEN, 'block_size': BLOCK_SIZE, 'batches': BATCHES, 'expected_concurrencies': EXPECTED_CONCURRENCIES, 'completed_concurrencies': []}
+    SESSION_PATH.write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding='utf-8')
+    return session
+
+def verify_preconditions():
+    metrics = cache_metrics()
+    if metrics['local'] is None or metrics['external'] is None:
+        sys.exit('local/external prefix-cache counters are unavailable on /metrics')
+    if not MOONCAKE_CONFIG.is_file():
+        sys.exit(f'Mooncake config not found: {MOONCAKE_CONFIG}')
+    config = json.loads(MOONCAKE_CONFIG.read_text(encoding='utf-8'))
+    if config.get('enable_ssd_offload'):
+        sys.exit('SSD offload is enabled; result cannot be labelled DRAM-only')
+discover_model()
+verify_preconditions()
+session = prepare_session()
+JSON_DIR.mkdir(parents=True, exist_ok=True)
+manifest = load_manifest()
+if manifest.get('input_tokens') != INPUT_LEN or manifest.get('block_size') != BLOCK_SIZE:
+    sys.exit('P1 manifest input length/block size does not match this run')
+vllm = vllm_command()
+proxy = start_capture_proxy()
+stage_rows = {stage: [] for stage in STAGES}
+validation_rows = []
+invalid_batches = []
+print(f'Concurrency=C{CONCURRENCY}; batches={BATCHES}; input={INPUT_LEN}; model={MODEL}; run_dir={RUN_DIR}')
+try:
+    for batch in range(1, BATCHES + 1):
+        seed = seed_for(batch)
+        print(f'\nC{CONCURRENCY} batch {batch}/{BATCHES}; seed={seed}')
+        pre_r1_reset = reset_local('pre-R1 local reset')
+        keys_before = mooncake_keys()
+        r1 = run_stage(vllm, 'R1-warmup', batch, seed, None, reset_evidence=pre_r1_reset)
+        entries = add_manifest_batch(manifest, batch, seed, r1['captures'])
+        expected_hashes = [entry['prompt_sha256'] for entry in entries]
+        r1['identity_valid'] = r1['hashes'] == expected_hashes
+        r1['valid'] = r1['valid'] and r1['identity_valid']
+        if not r1['identity_valid']:
+            r1['reason'] += '; manifest hash mismatch'
+        keys_after_r1 = wait_mooncake_settle(keys_before)
+        r1['reset_evidence'] += f'; Mooncake stable Keys {keys_before} -> {keys_after_r1}'
+        r2 = run_stage(vllm, 'R2-hbm-cache', batch, seed, entries)
+        pre_r3_reset = reset_local('pre-R3 local reset')
+        r3 = run_stage(vllm, 'R3-dram-cache', batch, seed, entries, reset_evidence=pre_r3_reset)
+        for result in (r1, r2, r3):
+            stage_rows[result['stage']].extend(raw_rows_for(result, entries))
+            validation_rows.append(validation_row(result))
+            if not result['valid']:
+                invalid_batches.append((batch, result['stage'], result['reason']))
+            local = result['delta']['local']
+            external = result['delta']['external']
+            print(f"  {result['stage']:<16} source={result['source']:<13} local={rate_text(local['rate'] if local else None):>7} external={rate_text(external['rate'] if external else None):>7} {('VALID' if result['valid'] else 'EXCLUDED')}")
+finally:
+    proxy.shutdown()
+    proxy.server_close()
+payload = build_payload(stage_rows, validation_rows)
+RESULT_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+session['completed_concurrencies'] = sorted(set(session.get('completed_concurrencies', [])) | {CONCURRENCY})
+SESSION_PATH.write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding='utf-8')
+rebuild_workbook()
+expected_total = BATCHES * sum(session.get('expected_concurrencies', []))
+actual_total = len(load_manifest()['requests'])
+print(f'\nResult: {RESULT_PATH}')
+print(f'Workbook: {WORKBOOK_PATH}')
+print(f'P1 manifest: {actual_total}/{expected_total} unique requests')
+if invalid_batches:
+    print(f'Excluded stage-batches: {len(invalid_batches)}')
+    for batch, stage, reason in invalid_batches:
+        print(f'  C{CONCURRENCY} batch={batch} {stage}: {reason}')
+    if STRICT:
+        sys.exit(2)
+PY

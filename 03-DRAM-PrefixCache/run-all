@@ -3,8 +3,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 export VB_RUN_DIR="${VB_RUN_DIR:-vbench-results/dram-session}"
+export VB_EXPECT_CONCURRENCIES="${VB_EXPECT_CONCURRENCIES:-1,5,10}"
 
 echo "Results from all stages will be written to: $VB_RUN_DIR"
-bash "$SCRIPT_DIR/R1-warmup"
-bash "$SCRIPT_DIR/R2-hbm-cache"
-bash "$SCRIPT_DIR/R3-dram-cache"
+echo "Execution order: C1 -> C5 -> C10; each batch runs R1 -> R2 -> reset HBM -> R3"
+
+VB_NEW_SESSION=1 bash "$SCRIPT_DIR/C1"
+VB_NEW_SESSION=0 bash "$SCRIPT_DIR/C5"
+VB_NEW_SESSION=0 bash "$SCRIPT_DIR/C10"

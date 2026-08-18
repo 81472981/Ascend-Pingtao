@@ -7,6 +7,24 @@ PORT=8000
 MOONCAKE_JSON=/tmp/mooncake.json
 MASTER_PORT=50088
 METRICS_PORT=9003
+# Mooncake 为每个 rank 注册的主机 DRAM 段；要求按 1GB 对齐。
+# 默认 256GB，也可在启动前用 MOONCAKE_SEGMENT_GB=... 覆盖。
+MOONCAKE_SEGMENT_GB="${MOONCAKE_SEGMENT_GB:-256}"
+
+case "$MOONCAKE_SEGMENT_GB" in
+  ''|*[!0-9]*)
+    echo "错误：MOONCAKE_SEGMENT_GB 必须是整数 GB，当前值: $MOONCAKE_SEGMENT_GB"
+    exit 1
+    ;;
+esac
+
+if [ -r /proc/meminfo ]; then
+  AVAILABLE_GB=$(awk '/MemAvailable:/ {printf "%d", $2 / 1024 / 1024}' /proc/meminfo)
+  echo "Mooncake 计划注册: ${MOONCAKE_SEGMENT_GB}GB；当前主机可用内存: 约 ${AVAILABLE_GB}GB"
+  if [ "$AVAILABLE_GB" -lt $((MOONCAKE_SEGMENT_GB + 32)) ]; then
+    echo "警告：建议主机可用内存至少为 Mooncake 段 + 32GB，否则 vLLM/Mooncake 可能启动失败或被 OOM。"
+  fi
+fi
 
 echo "===== [1/5] 清理旧进程 ====="
 # 强杀 vLLM（含子进程 EngineCore）和 mooncake_master
@@ -58,7 +76,7 @@ cat > $MOONCAKE_JSON <<EOF
   "protocol": "ascend",
   "device_name": "",
   "master_server_address": "127.0.0.1:$MASTER_PORT",
-  "global_segment_size": "8GB",
+  "global_segment_size": "${MOONCAKE_SEGMENT_GB}GB",
   "preferred_segment": false,
   "prefer_alloc_in_same_node": true
 }

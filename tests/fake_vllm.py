@@ -9,7 +9,10 @@ that vllm bench serve writes when using ``--save-result --save-detailed``.
 from __future__ import annotations
 
 import json
+import os
 import sys
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -43,12 +46,13 @@ def main() -> None:
         raise SystemExit(f"unexpected dataset-name: {dataset_name}")
     if arg_value(args, "--prefix-repetition-suffix-len") != "0":
         raise SystemExit("suffix length must be 0 for completely identical prompts")
-    if arg_value(args, "--prefix-repetition-num-prefixes") != "1":
-        raise SystemExit("num-prefixes must be 1 for completely identical prompts")
     if int(arg_value(args, "--prefix-repetition-prefix-len")) != 16 * 1024:
         raise SystemExit("prefix length must be 16384")
 
     num_prompts = int(arg_value(args, "--num-prompts"))
+    num_prefixes = int(arg_value(args, "--prefix-repetition-num-prefixes"))
+    if num_prefixes not in (1, num_prompts):
+        raise SystemExit("num-prefixes must be 1 or match num-prompts")
     if arg_value(args, "--max-concurrency") != str(num_prompts):
         raise SystemExit("max-concurrency must match num-prompts")
     if arg_value(args, "--request-rate") != "inf":
@@ -65,12 +69,54 @@ def main() -> None:
         except ValueError:
             pass
 
+    send_requests = os.environ.get("FAKE_VLLM_SEND_REQUESTS") == "1"
+    if send_requests:
+        host = arg_value(args, "--host")
+        port = int(arg_value(args, "--port"))
+        seed = int(arg_value(args, "--seed"))
+        request_prefix = arg_value(args, "--request-id-prefix")
+
+        def send(index: int) -> None:
+            prompt = " ".join(
+                f"seed{seed}-request{index}-token{token}"
+                for token in range(16 * 1024)
+            )
+            request = urllib.request.Request(
+                f"http://{host}:{port}/v1/completions",
+                data=json.dumps(
+                    {
+                        "model": "fake-model",
+                        "prompt": prompt,
+                        "max_tokens": 1,
+                        "stream": True,
+                    }
+                ).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "x-request-id": f"{request_prefix}{index}",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=30) as response:
+                response.read()
+
+        with ThreadPoolExecutor(max_workers=num_prompts) as executor:
+            list(executor.map(send, range(num_prompts)))
+
     # Deterministic, easy-to-check TTFT values.  The tiny formula makes the
     # test able to calculate the exact expected mean for every concurrency.
     ttfts = [
         0.010 + batch_number * 0.001 + index * 0.0001
         for index in range(num_prompts)
     ]
+    if send_requests:
+        if "-r1.json" in result_filename:
+            base_ttft = 0.030
+        elif "-r2.json" in result_filename:
+            base_ttft = 0.010
+        else:
+            base_ttft = 0.020
+        ttfts = [base_ttft + index * 0.0001 for index in range(num_prompts)]
     result = {
         "date": "20260816-000000",
         "backend": "openai",

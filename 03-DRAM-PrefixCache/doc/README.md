@@ -2,111 +2,217 @@
 
 ## 目的
 
-在昇腾 910C 单机单卡上，对同一个 16K Prefix（P1）比较：
+在昇腾 910C 单机单卡、vLLM/vLLM-Ascend 0.23.0 和 Mooncake 环境中，
+对同一组 16K 请求 P1 比较三种 TTFT：
 
+- `R1-warmup`：本地 HBM 和 Mooncake DRAM 均未命中的冷请求；
 - `R2-hbm-cache`：vLLM 本地 HBM Prefix Cache 命中；
 - `R3-dram-cache`：本地 HBM 未命中，从 AscendStoreConnector + Mooncake DRAM 恢复。
 
-默认请求形状为并发 `1/5/10`，每种并发 5 个批次。所有请求使用同一个由
-`prefix_repetition`、`seed=0` 生成的 P1，避免并发度变化时实际测试不同 Prefix。
+核心下降指标为 `R3/R2`，即从 DRAM 恢复相对于 HBM 命中的 TTFT 变化。
 
-## 为什么不把压力请求作为默认挤压方式
+## P1 请求设计
 
-压力请求产生的新 KV 也会写入 Mooncake。若 Mooncake DRAM 容量小于 HBM KV
-容量，最老的 P1 可能先从 DRAM 淘汰；此时下一次 P1 会重算，而不是从 DRAM
-恢复。`GPU cache usage`、`CPU cache usage` 或 `num_preemptions` 都只能描述系统
-总体状态，不能证明指定的 P1 位于 DRAM。
+默认测试三种并发，每种并发执行 5 个 batch：
 
-R3 使用 vLLM 的 benchmark/debug cache API：
+| 脚本 | 每批并发请求 | batch 数 | 唯一 P1 请求数 | 三阶段总推理数 |
+|---|---:|---:|---:|---:|
+| `C1` | 1 | 5 | 5 | 15 |
+| `C5` | 5 | 5 | 25 | 75 |
+| `C10` | 10 | 5 | 50 | 150 |
+| 合计 |  |  | 80 | 240 |
+
+唯一性规则：
+
+1. 同一 batch 内的请求全部不同；
+2. 不同 batch、不同并发之间的请求也全部不同；
+3. 每条请求的前 128 tokens（一个 cache block）就必须不同；
+4. 同一条请求在 R1、R2、R3 中必须完全相同。
+
+执行器使用 vLLM `prefix_repetition` 数据集，并令
+`num_prompts == num_prefixes == concurrency`。每个 `(concurrency, batch)` 使用
+固定且独立的 seed；同一 batch 的三个阶段复用同一 seed。
+
+脚本不会只依赖 seed 推断请求相同。它通过本地透明代理捕获实际发出的 prompt，
+使用 `x-request-id` 与 vLLM 详细结果逐条配对，并自动验证：
+
+- 实际输入 token 数为 16384；
+- 全文 SHA256 在 P1 的 80 条请求中唯一；
+- 前 128-token block SHA256 在 P1 中唯一；
+- 同一 `prompt_id` 的 R1/R2/R3 prompt SHA256 完全一致。
+
+## 逐批交错执行
+
+顶层脚本按并发命名为 `C1`、`C5`、`C10`。每个 batch 内执行：
+
+```text
+清除本地 HBM，保留 Mooncake
+  -> R1：并发发送该批全新请求
+  -> 等待 Mooncake Keys 增长并稳定
+  -> R2：并发重放同一批请求
+  -> 清除本地 HBM，保留 Mooncake
+  -> R3：并发重放同一批请求
+```
+
+例如 `C5` 的一个 batch 是 5 条不同请求 `A1...A5`：
+
+```text
+R1(A1...A5) -> R2(A1...A5) -> reset HBM -> R3(A1...A5)
+```
+
+下一 batch 改用 5 条全新请求 `B1...B5`，不是再次使用 `A1...A5`。
+
+每批 R1 前也会清一次本地 HBM。这用于消除上一批 R3 回载的 KV 对当前批次
+HBM 容量的干扰；`reset_connector=false`，因此之前写入 Mooncake 的 DRAM 数据
+不会被清除。
+
+## 为什么不使用压力请求挤出 HBM
+
+压力请求产生的新 KV 同样会写入 Mooncake。如果容量或淘汰水位设置不合理，
+需要测试的 P1 可能先从 Mooncake 淘汰，随后 R3 实际发生重算，而不是 DRAM 恢复。
+仅观察 `GPU cache usage`、`CPU cache usage` 或 `num_preemptions` 也不能证明指定
+P1 位于 DRAM。
+
+本测试使用 vLLM benchmark/debug cache API：
 
 ```text
 POST /reset_prefix_cache?reset_running_requests=false&reset_connector=false
 ```
 
-它清除本地 HBM Prefix Cache 索引，但保留 external connector 中的 Mooncake
-对象。数据路径仍然是真实的 Mooncake DRAM -> HBM 加载，只把不可控的 LRU
-压力淘汰换成确定性的本地淘汰。`R3-dram-cache` 会在每个小批次前调用一次，
-避免首批 P1 被加载回 HBM 后污染后续样本。
+它只清除本地 HBM Prefix Cache 索引，保留 Mooncake 对象。R3 的数据路径仍然是
+Mooncake DRAM -> HBM，只是把不可控的 LRU 压力淘汰替换为可验证的本地清理。
+`doc/打压测试.sh` 仅保留为手工实验参考，不参与正式测试流程。
 
 ## 自动判定规则
 
-判定使用每个批次前后的 vLLM Prometheus token counter 增量，不使用累计命中率：
+判定使用每个阶段前后的 vLLM Prometheus token counter 增量，而不是进程启动后的
+累计命中率：
 
-| 阶段 | 有效批次的硬条件 |
+| 阶段 | 有效 batch 的硬条件 |
 |---|---|
-| R1-warmup | 请求成功；仅用于填充和观察，只有服务清空后的首个 P1 是真正冷请求 |
-| R2-hbm-cache | `local prefix hit rate >= 95%` |
-| R3-dram-cache | `local prefix hit rate <= 5%` 且 `external prefix hit rate >= 95%` |
+| `R1-warmup` | 请求全部成功；输入和哈希校验通过；local、external hit rate 均 `<= 5%` |
+| `R2-hbm-cache` | 请求全部成功；与 R1 哈希一致；local hit rate `>= 95%` |
+| `R3-dram-cache` | 请求全部成功；与 R1 哈希一致；local hit rate `<= 5%` 且 external hit rate `>= 95%` |
 
-另外，运行前必须满足：
+另外还会检查：
 
-1. Mooncake `Keys=0`，保证首次 P1 是冷请求；
+1. 新测试会话开始时 Mooncake `Keys=0`；
 2. `/metrics` 同时暴露 local/external Prefix Cache counter；
 3. `mooncake.json` 没有启用 `enable_ssd_offload`；
-4. R3 开始前 Mooncake `Keys>0`；
-5. 每次清 HBM 前后 Mooncake external cache 被保留。
+4. R1 后 Mooncake `Keys` 必须增长并连续稳定；
+5. 每次清 HBM 前后 Mooncake `Keys` 不变；
+6. P1 全文及首个 128-token block 均无重复。
 
-不满足命中判据的批次仍写入 `validation` sheet，但会从性能汇总排除。严格模式
-默认开启，只要存在无效批次，脚本最终返回退出码 2。
+不满足条件的 stage/batch 仍写入 `validation` Sheet，但其 TTFT 会从汇总和分析中
+排除。严格模式默认开启，只要存在无效结果，对应 C 脚本最终返回退出码 2。
 
 ## 执行
 
-先参考 `doc/启动vllm&mk.sh` 启动干净的 vLLM + Mooncake。启动环境必须包含：
+先参考 `doc/启动vllm&mk.sh` 启动一套干净的 vLLM + Mooncake；启动环境必须包含：
 
 ```bash
 export VLLM_SERVER_DEV_MODE=1
 ```
 
-三个脚本均为自包含 Bash heredoc，不 import 仓库文件。可以打开文件复制全文，
-直接粘贴到目标机 Shell；默认共用 `vbench-results/dram-session`：
+推荐一次完成全部测试：
 
 ```bash
-bash R1-warmup
-bash R2-hbm-cache
-bash R3-dram-cache
-```
-
-也可以使用可选入口顺序执行三个阶段：
-
-```bash
+cd 03-DRAM-PrefixCache
+export VB_RUN_DIR="vbench-results/run-$(date +%Y%m%d-%H%M%S)"
 bash run-all
 ```
 
-如需为本次实验创建独立目录，应在三个脚本执行前设置同一个路径：
+`run-all` 的执行顺序是：
 
-```bash
-export VB_RUN_DIR="vbench-results/run-$(date +%Y%m%d-%H%M%S)"
+```text
+C1 -> C5 -> C10
 ```
 
-`R3-dram-cache` 已包含清理 HBM、保留 Mooncake 和命中校验，不再需要额外的
-`squeeze-hbm` 脚本。
+也可以在同一个测试会话中分别执行：
+
+```bash
+bash C1
+bash C5
+bash C10
+```
+
+`C1`、`C5`、`C10` 都是完整、自包含的 Bash heredoc，不依赖仓库中的公共
+Python 或 Shell 文件。可以单独复制任意一个文件的全文，直接粘贴到目标机 Shell
+执行。脚本使用明文紧凑格式，每个约 657 行、35KB；没有 Base64 或压缩载荷，
+所有执行逻辑都可以直接阅读和修改。也可以只测试某一个并发，例如在 Mooncake
+为空的新会话中：
+
+```bash
+VB_RUN_DIR=vbench-results/c5-only bash C5
+```
+
+同一个 C 脚本不能在原 Mooncake 会话中重复执行，因为其 R1 已不再是冷请求。
+需要重跑时，重新启动 vLLM + Mooncake，并使用新的 `VB_RUN_DIR`；或者运行完整的
+`run-all`，它会在确认 Mooncake 为空后清理该结果目录中的旧生成物。
 
 ## 输出
 
-每个阶段立即写出自己的文件，因此中途失败也能保留已完成阶段的数据：
+所有并发共同维护一个 Excel：
 
-- `R1-warmup.xlsx` 和 `R1-warmup-summary.json`；
-- `R2-hbm-cache.xlsx` 和 `R2-hbm-cache-summary.json`；
-- `R3-dram-cache.xlsx` 和 `R3-dram-cache-summary.json`；
-- `json/<stage>/`：vLLM 原始详细结果。
+- `dram-cache-benchmark.xlsx`：最终交付结果；
+- `C1-result.json`、`C5-result.json`、`C10-result.json`：每种并发的结构化结果；
+- `json/C*/R*/`：vLLM 原始详细结果；
+- `p1-manifest.json`：80 条请求的 token 数、seed 和哈希；
+- `p1-prompts.jsonl`：R1 捕获的精确 prompt，仅保存一次，用于审计和复现；
+- `session.json`：模型、输入长度和已完成并发信息。
 
-每个 Excel 含 `summary`、同名阶段页和 `validation`。R3 会读取同一目录下的
-R2 summary，在 `vs_R2_change_percent` 中直接给出性能变化。
+完整运行后的 Excel Sheet 顺序：
+
+1. `summary`；
+2. `R1-warmup`；
+3. `R2-hbm-cache`；
+4. `R3-dram-cache`；
+5. `validation`；
+6. `P1-manifest`；
+7. `TTFT-analysis`。
+
+`TTFT-analysis` 按并发列出三个阶段的平均 TTFT、有效请求数，以及 R2/R1、
+R3/R2、R3/R1 的变化百分比。
 
 ## 参数
 
 ```bash
 VB_BATCHES=5
-VB_CONCURRENCIES=1,5,10
+VB_INPUT_LEN=16384
+VB_BLOCK_SIZE=128
+VB_BASE_SEED=314159
 VB_MIN_HIT_RATE=0.95
-VB_MAX_LOCAL_HIT_RATE=0.05
-VB_STORE_SETTLE_SECONDS=2
+VB_MAX_MISS_RATE=0.05
+VB_STORE_STABLE_SECONDS=2
+VB_STORE_TIMEOUT_SECONDS=300
 VB_STRICT=1
 VB_RUN_DIR=vbench-results/dram-session
 VB_MOONCAKE_METRICS_URL=http://127.0.0.1:9003/metrics/summary
 MOONCAKE_CONFIG_PATH=/tmp/mooncake.json
 ```
 
+## Mooncake DRAM 容量
+
+`doc/启动vllm&mk.sh` 默认为单卡/单 rank 注册 256GB 主机 DRAM：
+
+```bash
+MOONCAKE_SEGMENT_GB=256 bash 'doc/启动vllm&mk.sh'
+```
+
+最终生成：
+
+```json
+"global_segment_size": "256GB"
+```
+
+`global_segment_size` 必须按 1GB 对齐；Mooncake 的 `GB` 在该配置中按
+1GiB（1073741824 bytes）解析。当 master 使用
+`--eviction_high_watermark_ratio 0.9` 时，256GB 段在约 230.4GB 使用量开始
+触发淘汰。80 条 Qwen3-8B 16K 请求的 BF16 KV 估算约为 180GB，因此 256GB
+有足够余量。主机 `MemAvailable` 还应额外预留 vLLM、Mooncake 元数据和操作系统
+内存。
+
 单机单卡不需要跨机 RDMA 网络，但 AscendStoreConnector 的 Mooncake backend
 仍需要与当前 vLLM-Ascend/CANN 版本匹配的 NPU transfer engine；不能用
-`--swap-space` 或 `--cpu-offload-gb` 代替，二者不代表 external Prefix Cache DRAM 命中。
+`--swap-space` 或 `--cpu-offload-gb` 代替，二者不代表 external Prefix Cache
+DRAM 命中。

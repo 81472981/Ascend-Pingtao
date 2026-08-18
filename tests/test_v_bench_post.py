@@ -13,9 +13,9 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = REPO_ROOT / "v-bench-post.py"
-C1_SHELL_SCRIPT = REPO_ROOT / "vb-post"
-BATCH_SHELL_SCRIPT = REPO_ROOT / "vb-post-batch"
+SCRIPT = REPO_ROOT / "02-HBM-PrefixCache" / "old" / "v-bench-post.py"
+C1_SHELL_SCRIPT = REPO_ROOT / "02-HBM-PrefixCache" / "vb-post"
+BATCH_SHELL_SCRIPT = REPO_ROOT / "02-HBM-PrefixCache" / "vb-post-batch"
 FAKE_VLLM = REPO_ROOT / "tests" / "fake_vllm.py"
 
 
@@ -196,8 +196,7 @@ class VBencPostTest(unittest.TestCase):
                 msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
             )
             run_dir = next(output_dir.iterdir())
-            result_path = run_dir / "result_c1.xlsx"
-            self.assertTrue(result_path.is_file())
+            result_path = next(run_dir.glob("result_c1*.xlsx"))
             with zipfile.ZipFile(result_path) as archive:
                 self.assertEqual(archive.testzip(), None)
                 sheet_names = archive.read("xl/workbook.xml").decode()
@@ -235,8 +234,7 @@ class VBencPostTest(unittest.TestCase):
                 msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
             )
             run_dir = next(output_dir.iterdir())
-            result_path = run_dir / "result_batch.xlsx"
-            self.assertTrue(result_path.is_file())
+            result_path = next(run_dir.glob("result_batch*.xlsx"))
             with zipfile.ZipFile(result_path) as archive:
                 workbook_xml = archive.read("xl/workbook.xml").decode()
                 self.assertIn('name="summary"', workbook_xml)
