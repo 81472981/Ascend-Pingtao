@@ -182,7 +182,7 @@ class DramPrefixCacheTest(unittest.TestCase):
                 self.assertEqual(r1_hashes, r2_hashes)
                 self.assertEqual(r1_hashes, r3_hashes)
 
-                workbook = result_dir / "dram-cache-benchmark.xlsx"
+                workbook = result_dir / "vb-result.xlsx"
                 with zipfile.ZipFile(workbook) as archive:
                     self.assertIsNone(archive.testzip())
                     names = archive.read("xl/workbook.xml").decode()
@@ -356,7 +356,7 @@ class DramPrefixCacheTest(unittest.TestCase):
                     len({row["first_block_sha256"] for row in requests}), 16
                 )
 
-                workbook = result_dir / "dram-cache-benchmark.xlsx"
+                workbook = result_dir / "vb-result.xlsx"
                 with zipfile.ZipFile(workbook) as archive:
                     self.assertIsNone(archive.testzip())
                     names = archive.read("xl/workbook.xml").decode()
