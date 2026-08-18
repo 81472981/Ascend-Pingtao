@@ -15,7 +15,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "03-DRAM-PrefixCache" / "C5"
-RUN_ALL = REPO_ROOT / "03-DRAM-PrefixCache" / "run-all"
+RUN_ALL = REPO_ROOT / "03-DRAM-PrefixCache" / "Run-all"
 FAKE_VLLM = REPO_ROOT / "tests" / "fake_vllm.py"
 
 try:
