@@ -10,6 +10,7 @@ import tempfile
 import threading
 import unittest
 import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -289,6 +290,7 @@ class DramPrefixCacheTest(unittest.TestCase):
                         "VB_BATCHES": "1",
                         "VB_STORE_STABLE_SECONDS": "0",
                         "VB_STORE_TIMEOUT_SECONDS": "5",
+                        "TZ": "UTC",
                     }
                 )
                 run_all_text = RUN_ALL.read_text(encoding="utf-8")
@@ -303,6 +305,8 @@ class DramPrefixCacheTest(unittest.TestCase):
                     max(len(line.encode("utf-8")) for line in run_all_text.splitlines()),
                     1024,
                 )
+                cn_timezone = timezone(timedelta(hours=8))
+                started_cn = datetime.now(cn_timezone) - timedelta(seconds=1)
                 completed = subprocess.run(
                     ["bash", "-s"],
                     input=run_all_text,
@@ -324,6 +328,13 @@ class DramPrefixCacheTest(unittest.TestCase):
                 self.assertRegex(
                     result_roots[0].name,
                     r"^\d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2}(?:-\d{2})?$",
+                )
+                result_time = datetime.strptime(
+                    result_roots[0].name[:19], "%Y-%m-%d %H-%M-%S"
+                ).replace(tzinfo=cn_timezone)
+                self.assertGreaterEqual(result_time, started_cn)
+                self.assertLessEqual(
+                    result_time, datetime.now(cn_timezone) + timedelta(seconds=1)
                 )
                 result_dir = result_roots[0]
                 self.assertEqual(

@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [[ -z "${VB_RUN_DIR:-}" ]]; then
   result_root="vb-result"
-  result_stamp="$(date "+%Y-%m-%d %H-%M-%S")"
+  result_stamp="$("${PYTHON:-python3}" -c 'from datetime import datetime, timedelta, timezone; print(datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H-%M-%S"))')"
   VB_RUN_DIR="$result_root/$result_stamp"
   result_suffix=2
   while [[ -e "$VB_RUN_DIR" ]]; do
@@ -58,7 +58,7 @@ SERVED_MODEL_NAME = os.environ.get('VB_SERVED_MODEL_NAME') or None
 TOKENIZER = os.environ.get('VB_TOKENIZER') or None
 def default_run_dir():
     root = Path('vb-result')
-    stamp = datetime.now().strftime('%Y-%m-%d %H-%M-%S')
+    stamp = datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H-%M-%S')
     candidate = root / stamp
     suffix = 2
     while candidate.exists():
