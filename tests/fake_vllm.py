@@ -81,6 +81,9 @@ def main() -> None:
                 f"seed{seed}-request{index}-token{token}"
                 for token in range(16 * 1024)
             )
+            headers = {"Content-Type": "application/json"}
+            if os.environ.get("FAKE_VLLM_OMIT_REQUEST_ID") != "1":
+                headers["x-request-id"] = f"{request_prefix}{index}"
             request = urllib.request.Request(
                 f"http://{host}:{port}/v1/completions",
                 data=json.dumps(
@@ -91,10 +94,7 @@ def main() -> None:
                         "stream": True,
                     }
                 ).encode("utf-8"),
-                headers={
-                    "Content-Type": "application/json",
-                    "x-request-id": f"{request_prefix}{index}",
-                },
+                headers=headers,
                 method="POST",
             )
             with urllib.request.urlopen(request, timeout=30) as response:

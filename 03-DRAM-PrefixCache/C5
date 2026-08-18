@@ -216,16 +216,21 @@ class CaptureProxyHandler(http.server.BaseHTTPRequestHandler):
         path = self.path.split('?', 1)[0]
         request_id = self.headers.get('x-request-id', '')
         record = None
-        if self.command == 'POST' and path.endswith('/v1/completions') and request_id.startswith(CAPTURE_PREFIX):
-            record = {'request_id': request_id, 'prompt': completion_prompt(request_body), 'status': None, 'error': ''}
+        if self.command == 'POST' and path.endswith('/v1/completions'):
             with CAPTURE_LOCK:
-                CAPTURE_RECORDS.append(record)
+                if CAPTURE_PREFIX:
+                    capture_index = len(CAPTURE_RECORDS)
+                    request_id = request_id or f'{CAPTURE_PREFIX}{capture_index}'
+                    record = {'request_id': request_id, 'capture_index': capture_index, 'prompt': completion_prompt(request_body), 'status': None, 'error': ''}
+                    CAPTURE_RECORDS.append(record)
         connection = http.client.HTTPConnection(HOST, PORT, timeout=1800)
         headers = {}
         for key, value in self.headers.items():
             if key.lower() in ('host', 'content-length', 'connection', 'accept-encoding'):
                 continue
             headers[key] = value
+        if record is not None:
+            headers['x-request-id'] = record['request_id']
         headers['Host'] = f'{HOST}:{PORT}'
         try:
             connection.request(self.command, self.path, body=request_body, headers=headers)
@@ -283,19 +288,28 @@ def begin_capture(prefix):
 def captured_prompts(prefix, expected):
     with CAPTURE_LOCK:
         records = [dict(item) for item in CAPTURE_RECORDS]
+    if len(records) != expected:
+        observed = [record['request_id'] or '<missing>' for record in records]
+        raise RuntimeError(f'captured {len(records)}/{expected} completion requests; x-request-id={observed}')
     indexed = []
     for record in records:
-        suffix = record['request_id'][len(prefix):]
+        request_id = record['request_id']
+        suffix = request_id[len(prefix):] if request_id.startswith(prefix) else ''
         if not suffix.isdigit():
-            raise RuntimeError(f"unexpected x-request-id: {record['request_id']}")
+            indexed = []
+            break
         indexed.append((int(suffix), record))
-    indexed.sort(key=lambda item: item[0])
-    indexes = [item[0] for item in indexed]
-    if len(indexed) != expected or len(set(indexes)) != expected:
-        raise RuntimeError(f'captured {len(indexed)}/{expected} uniquely indexed completion requests')
-    if indexes != list(range(indexes[0], indexes[0] + expected)):
-        raise RuntimeError(f'non-contiguous request indexes: {indexes}')
-    return [item[1] for item in indexed]
+    if indexed and len({item[0] for item in indexed}) == expected:
+        indexed.sort(key=lambda item: item[0])
+        records = [item[1] for item in indexed]
+        mode = 'x-request-id'
+    else:
+        records.sort(key=lambda item: item['capture_index'])
+        mode = 'proxy-arrival-order'
+    for index, record in enumerate(records):
+        record['request_id'] = record['request_id'] or f'{prefix}{index}'
+        record['capture_mode'] = mode
+    return records
 
 def prompt_sha(prompt):
     return hashlib.sha256(prompt.encode('utf-8')).hexdigest()
@@ -425,7 +439,7 @@ def run_stage(vllm, stage, batch, seed, expected_entries, reset_evidence=''):
     if expected_entries is None:
         identity_valid = len(hashes) == len(set(hashes)) == CONCURRENCY
     else:
-        identity_valid = hashes == [item['prompt_sha256'] for item in expected_entries]
+        identity_valid = sorted(hashes) == sorted((item['prompt_sha256'] for item in expected_entries))
     successful = completed == CONCURRENCY
     cache_ok, cache_reason = cache_valid(stage, delta)
     valid = successful and input_valid and identity_valid and cache_ok
@@ -618,7 +632,7 @@ try:
         r1 = run_stage(vllm, 'R1-warmup', batch, seed, None, reset_evidence=pre_r1_reset)
         entries = add_manifest_batch(manifest, batch, seed, r1['captures'])
         expected_hashes = [entry['prompt_sha256'] for entry in entries]
-        r1['identity_valid'] = r1['hashes'] == expected_hashes
+        r1['identity_valid'] = sorted(r1['hashes']) == sorted(expected_hashes)
         r1['valid'] = r1['valid'] and r1['identity_valid']
         if not r1['identity_valid']:
             r1['reason'] += '; manifest hash mismatch'

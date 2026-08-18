@@ -126,6 +126,7 @@ class DramPrefixCacheTest(unittest.TestCase):
                     {
                         "VLLM_BIN": f"{sys.executable} {FAKE_VLLM}",
                         "FAKE_VLLM_SEND_REQUESTS": "1",
+                        "FAKE_VLLM_OMIT_REQUEST_ID": "1",
                         "VB_PORT": str(server.server_address[1]),
                         "VB_MOONCAKE_METRICS_URL": (
                             f"http://127.0.0.1:{server.server_address[1]}"
