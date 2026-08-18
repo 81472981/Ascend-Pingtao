@@ -291,8 +291,21 @@ class DramPrefixCacheTest(unittest.TestCase):
                         "VB_STORE_TIMEOUT_SECONDS": "5",
                     }
                 )
+                run_all_text = RUN_ALL.read_text(encoding="utf-8")
+                c1_text = (RUN_ALL.parent / "C1").read_text(encoding="utf-8")
+                run_all_body = run_all_text.split("<<'PY'\n", 1)[1].rsplit(
+                    "\nPY", 1
+                )[0]
+                c1_body = c1_text.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+                self.assertEqual(run_all_body, c1_body)
+                self.assertLess(len(run_all_text.encode("utf-8")), 64 * 1024)
+                self.assertLessEqual(
+                    max(len(line.encode("utf-8")) for line in run_all_text.splitlines()),
+                    1024,
+                )
                 completed = subprocess.run(
-                    ["bash", str(RUN_ALL)],
+                    ["bash", "-s"],
+                    input=run_all_text,
                     text=True,
                     capture_output=True,
                     check=False,
