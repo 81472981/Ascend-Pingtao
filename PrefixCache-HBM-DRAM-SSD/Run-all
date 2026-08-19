@@ -910,7 +910,7 @@ def prepare_session():
         'tier_evidence': 'vLLM local/external token counters + Mooncake DRAM/SSD hit/byte/valid-get counters + SSD block-device read sectors',
         'required_source_hit_rate': REQUIRED_SOURCE_HIT_RATE,
         'ssd_offload_path': storage_config.get('ssd_offload_path'),
-        'ssd_device': storage_config.get('benchmark_ssd_source'),
+        'ssd_device': storage_config.get('benchmark_ssd_block_source') or storage_config.get('benchmark_ssd_source'),
         'ssd_fstype': storage_config.get('benchmark_ssd_fstype'),
         'ssd_kname': storage_config.get('benchmark_ssd_kname'),
         'ssd_direct_io': storage_config.get('benchmark_ssd_direct_io'),

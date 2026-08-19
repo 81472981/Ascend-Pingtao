@@ -10,6 +10,8 @@ METRICS_PORT=9003
 SSD_ROOT="${MOONCAKE_SSD_ROOT:-/mnt/mooncake-ssd-offload}"
 SSD_BUFFER_GB="${MOONCAKE_SSD_BUFFER_GB:-8}"
 SSD_QUOTA_GB="${MOONCAKE_SSD_QUOTA_GB:-3072}"
+SSD_BLOCK_DEVICE_OVERRIDE="${MOONCAKE_SSD_BLOCK_DEVICE:-}"
+SSD_PROBE_BYTES=$((256 * 1024 * 1024))
 # Mooncake 为每个 rank 注册的主机 DRAM 段；要求按 1GB 对齐。
 # 默认 256GB，也可在启动前用 MOONCAKE_SEGMENT_GB=... 覆盖。
 MOONCAKE_SEGMENT_GB="${MOONCAKE_SEGMENT_GB:-256}"
@@ -97,26 +99,48 @@ fi
 SSD_SOURCE=$(findmnt -n -o SOURCE -T "$SSD_SESSION_PATH" | head -1)
 SSD_FSTYPE=$(findmnt -n -o FSTYPE -T "$SSD_SESSION_PATH" | head -1)
 case "$SSD_FSTYPE" in
-  tmpfs|ramfs|devtmpfs|overlay)
+  tmpfs|ramfs|devtmpfs)
     echo "错误：SSD 路径位于 ${SSD_FSTYPE}，不是真实 SSD：$SSD_SESSION_PATH"
     exit 1
     ;;
+  overlay)
+    if [ -z "$SSD_BLOCK_DEVICE_OVERRIDE" ]; then
+      echo "错误：SSD 路径位于容器 overlay；必须显式设置 MOONCAKE_SSD_BLOCK_DEVICE，并通过 O_DIRECT 映射探针"
+      exit 1
+    fi
+    SSD_BLOCK_SOURCE="$SSD_BLOCK_DEVICE_OVERRIDE"
+    SSD_OVERLAY_MODE=true
+    ;;
+  *)
+    if [ -z "$SSD_SOURCE" ] || [ "${SSD_SOURCE#/dev/}" = "$SSD_SOURCE" ]; then
+      echo "错误：无法把 SSD 路径解析为本地块设备：source=$SSD_SOURCE path=$SSD_SESSION_PATH"
+      exit 1
+    fi
+    # bind mount 的 SOURCE 可能是 /dev/nvmeXnYpZ[/host/subdir]。
+    SSD_BLOCK_SOURCE="${SSD_SOURCE%%\[*}"
+    SSD_OVERLAY_MODE=false
+    ;;
 esac
-if [ -z "$SSD_SOURCE" ] || [ "${SSD_SOURCE#/dev/}" = "$SSD_SOURCE" ]; then
-  echo "错误：无法把 SSD 路径解析为本地块设备：source=$SSD_SOURCE path=$SSD_SESSION_PATH"
+if [ -z "$SSD_BLOCK_SOURCE" ] || [ "${SSD_BLOCK_SOURCE#/dev/}" = "$SSD_BLOCK_SOURCE" ] || [ ! -b "$SSD_BLOCK_SOURCE" ]; then
+  echo "错误：SSD 后端不是容器内可见的块设备：$SSD_BLOCK_SOURCE"
   exit 1
 fi
-SSD_ROTA=$(lsblk -ndo ROTA "$SSD_SOURCE" 2>/dev/null | head -1 | tr -d '[:space:]')
-SSD_KNAME=$(lsblk -ndo KNAME "$SSD_SOURCE" 2>/dev/null | head -1 | tr -d '[:space:]')
+SSD_ROTA=$(lsblk -ndo ROTA "$SSD_BLOCK_SOURCE" 2>/dev/null | head -1 | tr -d '[:space:]')
+SSD_KNAME=$(lsblk -ndo KNAME "$SSD_BLOCK_SOURCE" 2>/dev/null | head -1 | tr -d '[:space:]')
+SSD_DEVICE_SIZE_BYTES=$(lsblk -bndo SIZE "$SSD_BLOCK_SOURCE" 2>/dev/null | head -1 | tr -d '[:space:]')
 if [ "$SSD_ROTA" != "0" ]; then
-  echo "错误：${SSD_SOURCE} 未被识别为非旋转 SSD（ROTA=$SSD_ROTA）"
+  echo "错误：${SSD_BLOCK_SOURCE} 未被识别为非旋转 SSD（ROTA=$SSD_ROTA）"
   exit 1
 fi
 if [ -z "$SSD_KNAME" ] || [ ! -r "/sys/class/block/$SSD_KNAME/stat" ]; then
-  echo "错误：无法读取 SSD 块设备统计：source=$SSD_SOURCE kname=$SSD_KNAME"
+  echo "错误：无法读取 SSD 块设备统计：source=$SSD_BLOCK_SOURCE kname=$SSD_KNAME"
   exit 1
 fi
-echo "SSD 已验证：path=$SSD_SESSION_PATH source=$SSD_SOURCE fstype=$SSD_FSTYPE ROTA=$SSD_ROTA"
+if [ -z "$SSD_DEVICE_SIZE_BYTES" ] || [ "$SSD_DEVICE_SIZE_BYTES" -lt $((SSD_QUOTA_GB * 1024 * 1024 * 1024)) ]; then
+  echo "错误：SSD 块设备容量小于配置 quota：device=$SSD_BLOCK_SOURCE size=$SSD_DEVICE_SIZE_BYTES"
+  exit 1
+fi
+echo "SSD 设备已验证：path=$SSD_SESSION_PATH filesystem=$SSD_FSTYPE block=$SSD_BLOCK_SOURCE ROTA=$SSD_ROTA"
 
 if [ -r /proc/meminfo ]; then
   AVAILABLE_GB=$(awk '/MemAvailable:/ {printf "%d", $2 / 1024 / 1024}' /proc/meminfo)
@@ -163,6 +187,38 @@ while IFS= read -r -d '' stale_session; do
     fi
   fi
 done < <(find "$SSD_ROOT" -xdev -mindepth 1 -maxdepth 1 -type d -name 'session-*' -print0)
+
+if [ "$SSD_OVERLAY_MODE" = true ]; then
+  if ! command -v dd >/dev/null 2>&1; then
+    echo "错误：容器 overlay 验证需要 dd 的 O_DIRECT 支持"
+    exit 1
+  fi
+  SSD_PROBE_PATH="$SSD_SESSION_PATH/.ssd-device-probe-$$"
+  read -r probe_read_before probe_write_before < <(awk '{printf "%.0f %.0f\n", $3 * 512, $7 * 512}' "/sys/class/block/$SSD_KNAME/stat")
+  if ! dd if=/dev/zero of="$SSD_PROBE_PATH" bs=4M count=64 oflag=direct conv=fsync status=none; then
+    echo "错误：overlay 路径不支持 O_DIRECT 写入，不能可靠用作 SSD offload"
+    exit 1
+  fi
+  read -r probe_read_after probe_write_after < <(awk '{printf "%.0f %.0f\n", $3 * 512, $7 * 512}' "/sys/class/block/$SSD_KNAME/stat")
+  probe_write_delta=$((probe_write_after - probe_write_before))
+  if [ "$probe_write_delta" -lt "$SSD_PROBE_BYTES" ]; then
+    echo "错误：overlay 写入未映射到指定块设备：device=$SSD_BLOCK_SOURCE delta=$probe_write_delta expected>=$SSD_PROBE_BYTES"
+    exit 1
+  fi
+  probe_read_before="$probe_read_after"
+  if ! dd if="$SSD_PROBE_PATH" of=/dev/null bs=4M iflag=direct status=none; then
+    echo "错误：overlay 路径不支持 O_DIRECT 读取，不能可靠用作 SSD offload"
+    exit 1
+  fi
+  probe_read_after=$(awk '{printf "%.0f\n", $3 * 512}' "/sys/class/block/$SSD_KNAME/stat")
+  probe_read_delta=$((probe_read_after - probe_read_before))
+  rm -f "$SSD_PROBE_PATH"
+  if [ "$probe_read_delta" -lt "$SSD_PROBE_BYTES" ]; then
+    echo "错误：overlay 读取未映射到指定块设备：device=$SSD_BLOCK_SOURCE delta=$probe_read_delta expected>=$SSD_PROBE_BYTES"
+    exit 1
+  fi
+  echo "容器 overlay 已通过 O_DIRECT 映射探针：block=$SSD_BLOCK_SOURCE write=$probe_write_delta read=$probe_read_delta bytes"
+fi
 SSD_AVAILABLE_GB=$(df -Pk "$SSD_SESSION_PATH" | awk 'NR==2 {printf "%d", $4 / 1024 / 1024}')
 if [ "$SSD_AVAILABLE_GB" -lt "$SSD_QUOTA_GB" ]; then
   echo "错误：清理旧缓存后 SSD 可用空间约 ${SSD_AVAILABLE_GB}GB，仍小于配置 quota ${SSD_QUOTA_GB}GB"
@@ -210,9 +266,11 @@ cat > $MOONCAKE_JSON <<EOF
   "ssd_offload_path": "$SSD_SESSION_PATH",
   "benchmark_ssd_verified": true,
   "benchmark_ssd_source": "$SSD_SOURCE",
+  "benchmark_ssd_block_source": "$SSD_BLOCK_SOURCE",
   "benchmark_ssd_fstype": "$SSD_FSTYPE",
   "benchmark_ssd_kname": "$SSD_KNAME",
   "benchmark_ssd_direct_io": true,
+  "benchmark_ssd_overlay_verified": $SSD_OVERLAY_MODE,
   "benchmark_cleanup_managed": true,
   "benchmark_startup_pid": $$
 }
