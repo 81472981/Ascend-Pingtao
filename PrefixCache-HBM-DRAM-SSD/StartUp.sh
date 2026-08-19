@@ -122,13 +122,19 @@ case "$SSD_FSTYPE" in
     SSD_OVERLAY_MODE=false
     ;;
 esac
-if [ -z "$SSD_BLOCK_SOURCE" ] || [ "${SSD_BLOCK_SOURCE#/dev/}" = "$SSD_BLOCK_SOURCE" ] || [ ! -b "$SSD_BLOCK_SOURCE" ]; then
-  echo "错误：SSD 后端不是容器内可见的块设备：$SSD_BLOCK_SOURCE"
+if [ -z "$SSD_BLOCK_SOURCE" ] || [ "${SSD_BLOCK_SOURCE#/dev/}" = "$SSD_BLOCK_SOURCE" ]; then
+  echo "错误：SSD 后端设备名称无效：$SSD_BLOCK_SOURCE"
   exit 1
 fi
-SSD_ROTA=$(lsblk -ndo ROTA "$SSD_BLOCK_SOURCE" 2>/dev/null | head -1 | tr -d '[:space:]')
-SSD_KNAME=$(lsblk -ndo KNAME "$SSD_BLOCK_SOURCE" 2>/dev/null | head -1 | tr -d '[:space:]')
-SSD_DEVICE_SIZE_BYTES=$(lsblk -bndo SIZE "$SSD_BLOCK_SOURCE" 2>/dev/null | head -1 | tr -d '[:space:]')
+SSD_KNAME="${SSD_BLOCK_SOURCE##*/}"
+case "$SSD_KNAME" in
+  ''|*[!A-Za-z0-9._-]*) echo "错误：SSD kernel device name 非法：$SSD_KNAME"; exit 1 ;;
+esac
+# 容器可能只暴露 sysfs 而没有 /dev/nvme* 节点；从 lsblk 全量输出按 KNAME 查询。
+SSD_DEVICE_INFO=$(lsblk -bnr -o KNAME,ROTA,SIZE | awk -v kname="$SSD_KNAME" '$1 == kname {print $2, $3; exit}')
+read -r SSD_ROTA SSD_DEVICE_SIZE_BYTES <<EOF
+$SSD_DEVICE_INFO
+EOF
 if [ "$SSD_ROTA" != "0" ]; then
   echo "错误：${SSD_BLOCK_SOURCE} 未被识别为非旋转 SSD（ROTA=$SSD_ROTA）"
   exit 1
