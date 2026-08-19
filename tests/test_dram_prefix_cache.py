@@ -12,11 +12,12 @@ import unittest
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from xml.etree import ElementTree
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = REPO_ROOT / "03-DRAM-PrefixCache" / "C5"
-RUN_ALL = REPO_ROOT / "03-DRAM-PrefixCache" / "Run-all"
+SCRIPT = REPO_ROOT / "PrefixCache-HBM-DRAM-SSD" / "C5"
+RUN_ALL = REPO_ROOT / "PrefixCache-HBM-DRAM-SSD" / "Run-all"
 FAKE_VLLM = REPO_ROOT / "tests" / "fake_vllm.py"
 
 try:
@@ -187,8 +188,7 @@ class DramPrefixCacheTest(unittest.TestCase):
                     self.assertIsNone(archive.testzip())
                     names = archive.read("xl/workbook.xml").decode()
                     for sheet in (
-                        "summary",
-                        "TTFT-analysis",
+                        "Summary",
                         "R1-warmup",
                         "R2-hbm-cache",
                         "R3-dram-cache",
@@ -196,13 +196,18 @@ class DramPrefixCacheTest(unittest.TestCase):
                         "P1-manifest",
                     ):
                         self.assertIn(f'name="{sheet}"', names)
+                    self.assertIn("xl/sharedStrings.xml", archive.namelist())
+                    for name in archive.namelist():
+                        if name.endswith(".xml"):
+                            ElementTree.fromstring(archive.read(name))
+                        if name.startswith("xl/worksheets/"):
+                            self.assertNotIn(b"inlineStr", archive.read(name))
                 if openpyxl is not None:
                     loaded = openpyxl.load_workbook(workbook, read_only=True)
                     self.assertEqual(
                         loaded.sheetnames,
                         [
-                            "summary",
-                            "TTFT-analysis",
+                            "Summary",
                             "R1-warmup",
                             "R2-hbm-cache",
                             "R3-dram-cache",
@@ -212,48 +217,38 @@ class DramPrefixCacheTest(unittest.TestCase):
                     )
                     summary_headers = [
                         cell.value
-                        for cell in next(loaded["summary"].iter_rows(max_row=1))
+                        for cell in next(loaded["Summary"].iter_rows(max_row=1))
                     ]
                     self.assertEqual(
                         summary_headers,
                         [
-                            "stage",
-                            "concurrency",
-                            "successful_requests",
-                            "total_requests",
-                            "success_rate_percent",
-                            "ttft_samples",
-                            "avg_ttft_seconds",
-                            "min_ttft_seconds",
-                            "max_ttft_seconds",
+                            "Concurrency",
+                            "R1-Warmup-TTFT(s)",
+                            "R2-HBM-TTFT(s)",
+                            "R3-DRAM-TTFT(s)",
+                            "R3/R2-Degradation(s)",
+                            "R3/R2-Degradation(%)",
+                            "Success/All",
                         ],
                     )
-                    analysis_headers = [
-                        cell.value
-                        for cell in next(
-                            loaded["TTFT-analysis"].iter_rows(max_row=1)
-                        )
-                    ]
-                    self.assertEqual(
-                        analysis_headers,
-                        [
-                            "concurrency",
-                            "R1_avg_ttft_seconds",
-                            "R1_success_rate_percent",
-                            "R2_avg_ttft_seconds",
-                            "R2_success_rate_percent",
-                            "R3_avg_ttft_seconds",
-                            "R3_success_rate_percent",
-                            "R2_vs_R1_change_percent",
-                            "R3_vs_R2_change_percent",
-                            "R3_vs_R1_change_percent",
-                        ],
+                    summary = loaded["Summary"]
+                    self.assertEqual(summary.max_row, 2)
+                    self.assertEqual(summary.cell(2, 1).value, "C5")
+                    self.assertAlmostEqual(
+                        summary.cell(2, 5).value,
+                        summary.cell(2, 4).value - summary.cell(2, 3).value,
                     )
+                    self.assertAlmostEqual(
+                        summary.cell(2, 6).value,
+                        (summary.cell(2, 4).value / summary.cell(2, 3).value - 1)
+                        * 100,
+                    )
+                    self.assertEqual(summary.cell(2, 7).value, "30/30")
                     forbidden = ("sha", "identity", "validation", "cache")
                     self.assertFalse(
                         any(
                             marker in str(header).lower()
-                            for header in summary_headers + analysis_headers
+                            for header in summary_headers
                             for marker in forbidden
                         )
                     )
@@ -360,14 +355,24 @@ class DramPrefixCacheTest(unittest.TestCase):
                 with zipfile.ZipFile(workbook) as archive:
                     self.assertIsNone(archive.testzip())
                     names = archive.read("xl/workbook.xml").decode()
-                    self.assertEqual(names.count("<sheet "), 7)
+                    self.assertEqual(names.count("<sheet "), 6)
+                    self.assertIn("xl/sharedStrings.xml", archive.namelist())
+                    for name in archive.namelist():
+                        if name.endswith(".xml"):
+                            ElementTree.fromstring(archive.read(name))
+                        if name.startswith("xl/worksheets/"):
+                            self.assertNotIn(b"inlineStr", archive.read(name))
                 if openpyxl is not None:
                     loaded = openpyxl.load_workbook(workbook, read_only=True)
-                    analysis = loaded["TTFT-analysis"]
-                    self.assertEqual(analysis.max_row, 4)
+                    summary = loaded["Summary"]
+                    self.assertEqual(summary.max_row, 4)
                     self.assertEqual(
-                        [analysis.cell(row=row, column=1).value for row in range(2, 5)],
-                        [1, 5, 10],
+                        [summary.cell(row=row, column=1).value for row in range(2, 5)],
+                        ["C1", "C5", "C10"],
+                    )
+                    self.assertEqual(
+                        [summary.cell(row=row, column=7).value for row in range(2, 5)],
+                        ["3/3", "15/15", "30/30"],
                     )
                     loaded.close()
         finally:

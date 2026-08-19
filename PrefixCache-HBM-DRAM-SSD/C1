@@ -1,29 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ -z "${VB_RUN_DIR:-}" ]]; then
-  result_root="vb-result"
-  result_stamp="$("${PYTHON:-python3}" -c 'from datetime import datetime, timedelta, timezone; print(datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H-%M-%S"))')"
-  VB_RUN_DIR="$result_root/$result_stamp"
-  result_suffix=2
-  while [[ -e "$VB_RUN_DIR" ]]; do
-    printf -v suffix_text '%02d' "$result_suffix"
-    VB_RUN_DIR="$result_root/$result_stamp-$suffix_text"
-    ((result_suffix += 1))
-  done
-fi
-export VB_RUN_DIR
-export VB_EXPECT_CONCURRENCIES="${VB_EXPECT_CONCURRENCIES:-1,5,10}"
+export VB_CONCURRENCY=1
 
-echo "Results from all stages will be written to: $VB_RUN_DIR"
-echo "Self-contained execution: C1 -> C5 -> C10; each batch runs R1 -> R2 -> reset HBM -> R3"
-
-run_concurrency() {
-  VB_CONCURRENCY="$1" VB_NEW_SESSION="$2" "${PYTHON:-python3}" - <<'PY'
+# Readable, self-contained runner. Only Python stdlib is required.
+"${PYTHON:-python3}" - <<'PY'
 import hashlib
 import http.client
 import http.server
 import json
+import math
 import os
 import re
 import shlex
@@ -74,7 +60,6 @@ PROMPTS_PATH = RUN_DIR / 'p1-prompts.jsonl'
 WORKBOOK_PATH = RUN_DIR / 'vb-result.xlsx'
 MOONCAKE_URL = os.environ.get('VB_MOONCAKE_METRICS_URL', 'http://127.0.0.1:9003/metrics/summary')
 MOONCAKE_CONFIG = Path(os.environ.get('MOONCAKE_CONFIG_PATH', '/tmp/mooncake.json'))
-XML_INVALID = re.compile('[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\uFFFE\\uFFFF]')
 STAGES = ('R1-warmup', 'R2-hbm-cache', 'R3-dram-cache')
 if CONCURRENCY <= 0 or BATCHES <= 0:
     sys.exit('VB_CONCURRENCY and VB_BATCHES must be positive integers')
@@ -506,23 +491,60 @@ def col_name(index):
         index = index // 26 - 1
     return name
 
-def sheet_xml(rows):
+def clean_excel_text(value):
+    text = ''.join(
+        char for char in str(value)
+        if ord(char) in (9, 10, 13)
+        or 0x20 <= ord(char) <= 0xD7FF
+        or 0xE000 <= ord(char) <= 0xFFFD
+        or 0x10000 <= ord(char) <= 0x10FFFF
+    )
+    encoded = text.encode('utf-16-le')
+    if len(encoded) > 65534:
+        text = encoded[:65534].decode('utf-16-le', errors='ignore')
+    return text
+
+def is_excel_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+def shared_strings(sheets):
+    values = []
+    indexes = {}
+    count = 0
+    for rows in sheets.values():
+        for row in rows:
+            for value in row:
+                if value in (None, '') or is_excel_number(value):
+                    continue
+                count += 1
+                text = clean_excel_text(value)
+                if text not in indexes:
+                    indexes[text] = len(values)
+                    values.append(text)
+    items = ''.join(f'<si><t xml:space="preserve">{escape(value)}</t></si>' for value in values)
+    xml = f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="{count}" uniqueCount="{len(values)}">{items}</sst>'
+    return indexes, xml
+
+def sheet_xml(rows, string_indexes):
     body = []
     for row_number, row in enumerate(rows, 1):
         cells = []
         for column_number, value in enumerate(row):
             reference = f'{col_name(column_number)}{row_number}'
-            if isinstance(value, (int, float)) and (not isinstance(value, bool)):
+            if value in (None, ''):
+                continue
+            if is_excel_number(value):
                 cells.append(f'<c r="{reference}"><v>{value}</v></c>')
             else:
-                text = escape(XML_INVALID.sub('', str(value)))
-                cells.append(f'<c r="{reference}" t="inlineStr"><is><t>{text}</t></is></c>')
+                index = string_indexes[clean_excel_text(value)]
+                cells.append(f'<c r="{reference}" t="s"><v>{index}</v></c>')
         body.append(f'''<row r="{row_number}">{''.join(cells)}</row>''')
     last_column = col_name(max((len(row) for row in rows), default=1) - 1)
     last_row = max(len(rows), 1)
     return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:{last_column}{last_row}"/><sheetData>{''.join(body)}</sheetData></worksheet>"""
 
 def write_xlsx(path, sheets):
+    string_indexes, strings_xml = shared_strings(sheets)
     content = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
     relationships = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
     sheet_tags = ''
@@ -530,6 +552,8 @@ def write_xlsx(path, sheets):
         content += f'<Override PartName="/xl/worksheets/sheet{index}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
         relationships += f'<Relationship Id="rId{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{index}.xml"/>'
         sheet_tags += f'<sheet name="{escape(name)}" sheetId="{index}" r:id="rId{index}"/>'
+    content += '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>'
+    relationships += f'<Relationship Id="rId{len(sheets) + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>'
     content += '</Types>'
     relationships += '</Relationships>'
     workbook = f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>{sheet_tags}</sheets></workbook>'
@@ -539,8 +563,9 @@ def write_xlsx(path, sheets):
         archive.writestr('_rels/.rels', root_relationships)
         archive.writestr('xl/workbook.xml', workbook)
         archive.writestr('xl/_rels/workbook.xml.rels', relationships)
+        archive.writestr('xl/sharedStrings.xml', strings_xml)
         for index, rows in enumerate(sheets.values(), 1):
-            archive.writestr(f'xl/worksheets/sheet{index}.xml', sheet_xml(rows))
+            archive.writestr(f'xl/worksheets/sheet{index}.xml', sheet_xml(rows, string_indexes))
 
 def percent_change(current, baseline):
     if current is None or baseline in (None, 0):
@@ -559,25 +584,26 @@ def completed_payloads():
 
 def rebuild_workbook():
     payloads = completed_payloads()
-    summary = [['stage', 'concurrency', 'successful_requests', 'total_requests', 'success_rate_percent', 'ttft_samples', 'avg_ttft_seconds', 'min_ttft_seconds', 'max_ttft_seconds']]
+    summary = [['Concurrency', 'R1-Warmup-TTFT(s)', 'R2-HBM-TTFT(s)', 'R3-DRAM-TTFT(s)', 'R3/R2-Degradation(s)', 'R3/R2-Degradation(%)', 'Success/All']]
     stage_sheets = {stage: [RAW_HEADER] for stage in STAGES}
     validation = [VALIDATION_HEADER]
     for concurrency, payload in payloads.items():
-        summary.extend(payload['summary_rows'])
         for stage in STAGES:
             stage_sheets[stage].extend(payload['stage_rows'].get(stage, []))
         validation.extend(payload['validation_rows'])
     manifest = load_manifest()
     manifest_rows = [['prompt_id', 'concurrency', 'batch', 'request_index', 'seed', 'input_tokens', 'prompt_sha256', 'token_sha256', 'first_block_sha256']]
     manifest_rows.extend(([item['prompt_id'], item['concurrency'], item['batch'], item['request_index'], item['seed'], item['input_tokens'], item['prompt_sha256'], item['token_sha256'], item['first_block_sha256']] for item in sorted(manifest['requests'].values(), key=lambda value: (value['concurrency'], value['batch'], value['request_index']))))
-    analysis = [['concurrency', 'R1_avg_ttft_seconds', 'R1_success_rate_percent', 'R2_avg_ttft_seconds', 'R2_success_rate_percent', 'R3_avg_ttft_seconds', 'R3_success_rate_percent', 'R2_vs_R1_change_percent', 'R3_vs_R2_change_percent', 'R3_vs_R1_change_percent']]
     for concurrency, payload in payloads.items():
         values = payload['stage_summary']
         r1 = values['R1-warmup']['avg_ttft_seconds']
         r2 = values['R2-hbm-cache']['avg_ttft_seconds']
         r3 = values['R3-dram-cache']['avg_ttft_seconds']
-        analysis.append([concurrency, r1 if r1 is not None else '', values['R1-warmup']['success_rate_percent'], r2 if r2 is not None else '', values['R2-hbm-cache']['success_rate_percent'], r3 if r3 is not None else '', values['R3-dram-cache']['success_rate_percent'], percent_change(r2, r1), percent_change(r3, r2), percent_change(r3, r1)])
-    sheets = {'summary': summary, 'TTFT-analysis': analysis, **stage_sheets}
+        successful = sum(values[stage]['successful_requests'] for stage in STAGES)
+        total = sum(values[stage]['total_requests'] for stage in STAGES)
+        degradation = r3 - r2 if r2 is not None and r3 is not None else ''
+        summary.append([f'C{concurrency}', r1 if r1 is not None else '', r2 if r2 is not None else '', r3 if r3 is not None else '', degradation, percent_change(r3, r2), f'{successful}/{total}'])
+    sheets = {'Summary': summary, **stage_sheets}
     sheets['validation'] = validation
     sheets['P1-manifest'] = manifest_rows
     write_xlsx(WORKBOOK_PATH, sheets)
@@ -694,8 +720,3 @@ if invalid_batches:
     if STRICT:
         sys.exit(2)
 PY
-}
-
-run_concurrency 1 1
-run_concurrency 5 0
-run_concurrency 10 0
