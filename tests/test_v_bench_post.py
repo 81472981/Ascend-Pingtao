@@ -13,9 +13,9 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = REPO_ROOT / "02-HBM-PrefixCache" / "old" / "v-bench-post.py"
-C1_SHELL_SCRIPT = REPO_ROOT / "02-HBM-PrefixCache" / "vb-post"
-BATCH_SHELL_SCRIPT = REPO_ROOT / "02-HBM-PrefixCache" / "vb-post-batch"
+SCRIPT = REPO_ROOT / "bak" / "02-HBM-PrefixCache" / "old" / "v-bench-post.py"
+C1_SHELL_SCRIPT = REPO_ROOT / "bak" / "02-HBM-PrefixCache" / "vb-post"
+BATCH_SHELL_SCRIPT = REPO_ROOT / "bak" / "02-HBM-PrefixCache" / "vb-post-batch"
 FAKE_VLLM = REPO_ROOT / "tests" / "fake_vllm.py"
 
 

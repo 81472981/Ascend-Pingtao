@@ -1,25 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ -z "${VB_RUN_DIR:-}" ]]; then
-  result_root="vb-result"
-  result_stamp="$("${PYTHON:-python3}" -c 'from datetime import datetime, timedelta, timezone; print(datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H-%M-%S"))')"
-  VB_RUN_DIR="$result_root/$result_stamp"
-  result_suffix=2
-  while [[ -e "$VB_RUN_DIR" ]]; do
-    printf -v suffix_text '%02d' "$result_suffix"
-    VB_RUN_DIR="$result_root/$result_stamp-$suffix_text"
-    ((result_suffix += 1))
-  done
-fi
-export VB_RUN_DIR
-export VB_EXPECT_CONCURRENCIES="${VB_EXPECT_CONCURRENCIES:-1,5,10,100}"
+export VB_CONCURRENCY=100
 
-echo "Results from all stages will be written to: $VB_RUN_DIR"
-echo "Self-contained execution: C1 -> C5 -> C10 -> C100; each batch runs R1 -> R2 -> reset HBM -> R3"
-
-run_concurrency() {
-  VB_CONCURRENCY="$1" VB_NEW_SESSION="$2" "${PYTHON:-python3}" - <<'PY'
+# Readable, self-contained runner. Only Python stdlib is required.
+"${PYTHON:-python3}" - <<'PY'
 import hashlib
 import http.client
 import http.server
@@ -735,9 +720,3 @@ if invalid_batches:
     if STRICT:
         sys.exit(2)
 PY
-}
-
-run_concurrency 1 1
-run_concurrency 5 0
-run_concurrency 10 0
-run_concurrency 100 0
