@@ -148,6 +148,8 @@ MOONCAKE_URL = os.environ.get('VB_MOONCAKE_METRICS_URL', 'http://127.0.0.1:9003/
 MOONCAKE_PROMETHEUS_URL = os.environ.get('VB_MOONCAKE_PROMETHEUS_URL') or MOONCAKE_URL.removesuffix('/summary')
 MOONCAKE_CONFIG = Path(os.environ.get('MOONCAKE_CONFIG_PATH', '/tmp/mooncake.json'))
 SSD_BLOCK_STAT = None
+RUNTIME_ROOT_PID = None
+RUNTIME_READ_BYTES_OVERRIDE = Path(os.environ['VB_RUNTIME_READ_BYTES_PATH']) if os.environ.get('VB_RUNTIME_READ_BYTES_PATH') else None
 STAGES = ('R1-warmup', 'R2-hbm-cache', 'R3-dram-cache', 'R4-ssd-cache')
 if CONCURRENCY <= 0 or BATCHES <= 0:
     sys.exit('VB_CONCURRENCY and VB_BATCHES must be positive integers')
@@ -160,14 +162,12 @@ if SSD_PRESSURE_TIMEOUT_SECONDS <= 0 or SSD_EVICTION_LEASE_WAIT_SECONDS < 0:
 REQUIRED_SOURCE_HIT_RATE = max(MIN_HIT_RATE, (INPUT_LEN - BLOCK_SIZE) / INPUT_LEN - 1e-9)
 CACHE_PAIRS = {'local': (('vllm:prefix_cache_queries_total', 'vllm:prefix_cache_hits_total'), ('vllm:prefix_cache_queries', 'vllm:prefix_cache_hits')), 'external': (('vllm:external_prefix_cache_queries_total', 'vllm:external_prefix_cache_hits_total'), ('vllm:external_prefix_cache_queries', 'vllm:external_prefix_cache_hits'))}
 TIER_METRIC_NAMES = {
-    'dram_hits': ('mem_cache_hit_nums_', 'mem_cache_hit_nums'),
-    'ssd_hits': ('file_cache_hit_nums_', 'file_cache_hit_nums'),
-    'dram_hit_bytes': ('mem_cache_hit_bytes_total',),
-    'ssd_hit_bytes': ('file_cache_hit_bytes_total',),
-    'dram_objects': ('mem_cache_nums_', 'mem_cache_nums'),
-    'ssd_objects': ('file_cache_nums_', 'file_cache_nums'),
-    'dram_evicted_objects': ('master_evicted_key_count_mem',),
-    'valid_gets': ('valid_get_nums_', 'valid_get_nums'),
+    # Mooncake 0.3.11 defines cache-hit counters internally but does not
+    # serialize them on /metrics.  These storage/eviction metrics are exported.
+    'dram_allocated_bytes': ('master_allocated_bytes',),
+    'ssd_allocated_bytes': ('master_allocated_file_size_bytes',),
+    'evicted_bytes': ('master_evicted_size_bytes',),
+    'evicted_objects': ('master_evicted_key_count',),
 }
 CAPTURE_LOCK = threading.Lock()
 CAPTURE_RECORDS = []
@@ -258,6 +258,44 @@ def ssd_device_read_bytes():
     except (OSError, IndexError, ValueError):
         return None
 
+def runtime_read_bytes():
+    """Physical storage reads by StartUp.sh and its Mooncake/vLLM descendants."""
+    if RUNTIME_READ_BYTES_OVERRIDE is not None:
+        try:
+            return int(RUNTIME_READ_BYTES_OVERRIDE.read_text(encoding='ascii').strip())
+        except (OSError, ValueError):
+            return None
+    if RUNTIME_ROOT_PID is None or not Path(f'/proc/{RUNTIME_ROOT_PID}').exists():
+        return None
+    parents = {}
+    for stat_path in Path('/proc').glob('[0-9]*/stat'):
+        try:
+            text = stat_path.read_text(encoding='ascii')
+            tail = text[text.rfind(')') + 2:].split()
+            parents[int(stat_path.parent.name)] = int(tail[1])
+        except (OSError, IndexError, ValueError):
+            continue
+    runtime_pids = {RUNTIME_ROOT_PID}
+    changed = True
+    while changed:
+        changed = False
+        for pid, parent in parents.items():
+            if parent in runtime_pids and pid not in runtime_pids:
+                runtime_pids.add(pid)
+                changed = True
+    total = 0
+    readable = 0
+    for pid in runtime_pids:
+        try:
+            for line in Path(f'/proc/{pid}/io').read_text(encoding='ascii').splitlines():
+                if line.startswith('read_bytes:'):
+                    total += int(line.split(':', 1)[1])
+                    readable += 1
+                    break
+        except (OSError, ValueError):
+            continue
+    return total if readable else None
+
 def cache_metrics():
     try:
         text = fetch(f'http://{HOST}:{PORT}/metrics')
@@ -334,14 +372,13 @@ def wait_mooncake_settle(keys_before):
         time.sleep(0.5)
     raise RuntimeError(f'Mooncake store did not become stable within {STORE_TIMEOUT_SECONDS:g}s; Keys {keys_before} -> {last_keys}')
 
-def wait_ssd_replicas(ssd_objects_before, expected_new_objects):
+def wait_ssd_replicas(ssd_bytes_before):
     deadline = time.monotonic() + STORE_TIMEOUT_SECONDS
     last = None
     stable_since = None
-    target = ssd_objects_before + max(expected_new_objects, 1)
     while time.monotonic() < deadline:
-        current = tier_metrics().get('ssd_objects')
-        reached = current is not None and current >= target
+        current = tier_metrics().get('ssd_allocated_bytes')
+        reached = current is not None and current > ssd_bytes_before
         if reached and current == last:
             if stable_since is None:
                 stable_since = time.monotonic()
@@ -353,7 +390,7 @@ def wait_ssd_replicas(ssd_objects_before, expected_new_objects):
         time.sleep(0.5)
     raise RuntimeError(
         f'SSD replicas did not become complete within {STORE_TIMEOUT_SECONDS:g}s; '
-        f'ssd_objects {ssd_objects_before} -> {last}, target >= {target}'
+        f'SSD allocated bytes {ssd_bytes_before} -> {last}; required a positive, stable increase'
     )
 
 def completion_prompt(body):
@@ -527,52 +564,53 @@ def evict_all_current_dram(vllm):
         print(f'  Waiting {SSD_EVICTION_LEASE_WAIT_SECONDS:g}s for R3 read leases to expire before DRAM eviction')
         time.sleep(SSD_EVICTION_LEASE_WAIT_SECONDS)
     before = tier_metrics()
-    if before['dram_evicted_objects'] is None or before['ssd_objects'] is None:
-        raise RuntimeError('Mooncake DRAM eviction/SSD object metrics are unavailable')
+    if before['dram_allocated_bytes'] is None or before['ssd_allocated_bytes'] is None:
+        raise RuntimeError('Mooncake DRAM/SSD allocated-byte metrics are unavailable')
     deadline = time.monotonic() + SSD_PRESSURE_TIMEOUT_SECONDS
-    target = int(before['dram_objects'] or 0)
+    target = int(before['dram_allocated_bytes'] or 0)
+    evicted_before = int(before['evicted_bytes'] or 0)
     if target == 0:
-        return 'no DRAM objects remained before R4; no pressure required'
+        return 'no DRAM bytes remained before R4; no pressure required'
     last = before
     for pressure_round in range(1, SSD_PRESSURE_MAX_ROUNDS + 1):
         if time.monotonic() >= deadline:
             break
         run_command(pressure_command(vllm, 0, pressure_round))
         last = tier_metrics()
-        evicted = int(last['dram_evicted_objects'] - before['dram_evicted_objects'])
+        evicted = int((last['evicted_bytes'] or 0) - evicted_before)
         print(
-            f'  SSD pressure round={pressure_round}: DRAM-evicted={evicted}/{target}, '
-            f'DRAM-objects={int(last["dram_objects"] or 0)}, SSD-objects={int(last["ssd_objects"] or 0)}'
+            f'  SSD pressure round={pressure_round}: evicted-bytes={evicted}/{target}, '
+            f'DRAM-bytes={int(last["dram_allocated_bytes"] or 0)}, SSD-bytes={int(last["ssd_allocated_bytes"] or 0)}'
         )
         if evicted >= target:
             return (
-                f'pressure rounds={pressure_round}; DRAM evicted objects={evicted} >= all pre-pressure DRAM objects={target}; '
-                f'SSD objects={int(last["ssd_objects"])}'
+                f'pressure rounds={pressure_round}; evicted bytes={evicted} >= complete pre-pressure DRAM bytes={target}; '
+                f'P1 leases expired before newer pressure leases; SSD allocated bytes={int(last["ssd_allocated_bytes"])}'
             )
-    evicted = int((last.get('dram_evicted_objects') or 0) - before['dram_evicted_objects'])
+    evicted = int((last.get('evicted_bytes') or 0) - evicted_before)
     raise RuntimeError(
         f'could not force enough DRAM eviction for SSD validation: evicted={evicted}, '
-        f'required all pre-pressure DRAM objects={target}, rounds={SSD_PRESSURE_MAX_ROUNDS}, timeout={SSD_PRESSURE_TIMEOUT_SECONDS:g}s'
+        f'required complete pre-pressure DRAM bytes={target}, rounds={SSD_PRESSURE_MAX_ROUNDS}, timeout={SSD_PRESSURE_TIMEOUT_SECONDS:g}s'
     )
 
 def source_name(stage, delta, storage_delta):
     local = delta['local'] and delta['local']['rate']
     external = delta['external'] and delta['external']['rate']
-    dram_hits = storage_delta.get('dram_hits') or 0
-    ssd_hits = storage_delta.get('ssd_hits') or 0
     if local is not None and local >= REQUIRED_SOURCE_HIT_RATE:
         return 'HBM'
-    if external is not None and external >= REQUIRED_SOURCE_HIT_RATE and dram_hits > 0 and ssd_hits == 0:
+    runtime_reads = storage_delta.get('runtime_read_bytes')
+    dram_after = storage_delta.get('dram_allocated_after') or 0
+    if external is not None and external >= REQUIRED_SOURCE_HIT_RATE and runtime_reads == 0 and dram_after > 0:
         return 'DRAM'
-    physical_reads = storage_delta.get('ssd_device_read_bytes')
-    ssd_hit_bytes = storage_delta.get('ssd_hit_bytes') or 0
-    if external is not None and external >= REQUIRED_SOURCE_HIT_RATE and ssd_hits > 0 and dram_hits == 0 and physical_reads is not None and physical_reads >= ssd_hit_bytes > 0:
+    device_reads = storage_delta.get('ssd_device_read_bytes')
+    ssd_after = storage_delta.get('ssd_allocated_after') or 0
+    if external is not None and external >= REQUIRED_SOURCE_HIT_RATE and runtime_reads is not None and device_reads is not None and device_reads >= runtime_reads > 0 and ssd_after > 0:
         return 'SSD'
     if stage == 'R1-warmup' and local is not None and external is not None and local <= MAX_MISS_RATE and external <= MAX_MISS_RATE:
         return 'MISS'
     return 'MISS_OR_MIXED'
 
-def cache_valid(stage, delta, storage_delta):
+def cache_valid(stage, delta, storage_delta, transition_verified=False):
     local = delta['local'] and delta['local']['rate']
     external = delta['external'] and delta['external']['rate']
     if local is None or external is None:
@@ -584,32 +622,35 @@ def cache_valid(stage, delta, storage_delta):
     if stage == 'R2-hbm-cache':
         valid = local >= REQUIRED_SOURCE_HIT_RATE
         return (valid, f'HBM proof: local={rate_text(local)}, required >= {REQUIRED_SOURCE_HIT_RATE:.2%} (all cacheable blocks)')
-    dram_hits = storage_delta.get('dram_hits')
-    ssd_hits = storage_delta.get('ssd_hits')
-    dram_bytes = storage_delta.get('dram_hit_bytes')
-    ssd_bytes = storage_delta.get('ssd_hit_bytes')
-    valid_gets = storage_delta.get('valid_gets')
+    dram_after = storage_delta.get('dram_allocated_after')
+    ssd_after = storage_delta.get('ssd_allocated_after')
+    runtime_reads = storage_delta.get('runtime_read_bytes')
     device_read_bytes = storage_delta.get('ssd_device_read_bytes')
-    if None in (dram_hits, ssd_hits, dram_bytes, ssd_bytes, valid_gets, device_read_bytes):
-        return (False, 'Mooncake DRAM/SSD tier counters or SSD block-device read counter unavailable')
+    if None in (dram_after, ssd_after, runtime_reads, device_read_bytes):
+        return (False, 'Mooncake allocation, runtime process-I/O, or SSD block-device counter unavailable')
     common = local <= MAX_MISS_RATE and external >= REQUIRED_SOURCE_HIT_RATE
     if stage == 'R3-dram-cache':
-        tier_ok = valid_gets > 0 and dram_hits == valid_gets and dram_bytes > 0 and ssd_hits == 0 and ssd_bytes == 0
+        # Direct I/O is mandatory.  Therefore an external hit with no physical
+        # read_bytes in any Mooncake/vLLM descendant cannot have loaded SSD.
+        tier_ok = dram_after > 0 and runtime_reads == 0
         valid = common and tier_ok
         reason = (
             f'DRAM proof: local={rate_text(local)} <= {MAX_MISS_RATE:.0%}, '
             f'external={rate_text(external)} >= {REQUIRED_SOURCE_HIT_RATE:.2%} (all cacheable blocks), '
-            f'Mooncake valid gets={valid_gets:g}, DRAM hits={dram_hits:g} (all gets)/bytes={dram_bytes:g}, '
-            f'SSD hits/bytes={ssd_hits:g}/{ssd_bytes:g} = 0; block-device reads={device_read_bytes:g} bytes (diagnostic only)'
+            f'Mooncake DRAM allocated={dram_after:g} bytes; benchmark-runtime physical reads={runtime_reads:g} bytes = 0 '
+            f'(DirectIO excludes SSD); NVMe reads={device_read_bytes:g} bytes (diagnostic, may include other containers)'
         )
         return (valid, reason)
-    tier_ok = valid_gets > 0 and ssd_hits == valid_gets and ssd_bytes > 0 and dram_hits == 0 and dram_bytes == 0 and device_read_bytes >= ssd_bytes
+    # The pressure pass proves the complete pre-pressure DRAM byte volume was
+    # evicted.  Process-scoped physical reads exclude unrelated containers;
+    # the verified backing-device counter independently binds them to the SSD.
+    tier_ok = transition_verified and ssd_after > 0 and device_read_bytes >= runtime_reads > 0
     valid = common and tier_ok
     reason = (
         f'SSD proof: local={rate_text(local)} <= {MAX_MISS_RATE:.0%}, '
         f'external={rate_text(external)} >= {REQUIRED_SOURCE_HIT_RATE:.2%} (all cacheable blocks), '
-        f'Mooncake valid gets={valid_gets:g}, SSD hits={ssd_hits:g} (all gets)/bytes={ssd_bytes:g}, '
-        f'DRAM hits/bytes={dram_hits:g}/{dram_bytes:g} = 0; physical SSD reads={device_read_bytes:g} bytes >= SSD hit bytes={ssd_bytes:g}'
+        f'complete pre-pressure DRAM eviction={transition_verified}; Mooncake SSD allocated={ssd_after:g} bytes; '
+        f'benchmark-runtime physical reads={runtime_reads:g} bytes > 0 and verified NVMe reads={device_read_bytes:g} bytes >= runtime reads'
     )
     return (valid, reason)
 
@@ -664,7 +705,7 @@ def result_arrays(data):
     completed = sum((1 for index in range(CONCURRENCY) if index < len(ttfts) and ttfts[index] is not None and (not (errors[index] if index < len(errors) else None))))
     return (completed, CONCURRENCY - completed)
 
-def run_stage(vllm, stage, batch, seed, expected_entries, reset_evidence=''):
+def run_stage(vllm, stage, batch, seed, expected_entries, reset_evidence='', transition_verified=False):
     stage_slug = stage.split('-', 1)[0].lower()
     request_prefix = f'p1-c{CONCURRENCY}-b{batch}-{stage_slug}-'
     filename = f'c{CONCURRENCY:03d}-b{batch:02d}-{stage_slug}.json'
@@ -673,15 +714,28 @@ def run_stage(vllm, stage, batch, seed, expected_entries, reset_evidence=''):
     begin_capture(request_prefix)
     before = cache_metrics()
     tier_before = tier_metrics()
+    runtime_reads_before = runtime_read_bytes()
     device_reads_before = ssd_device_read_bytes()
     run_command(benchmark_command(vllm, stage, batch, seed, filename, request_prefix))
     after = cache_metrics()
     tier_after = tier_metrics()
+    runtime_reads_after = runtime_read_bytes()
     device_reads_after = ssd_device_read_bytes()
     data = json.loads(output_path.read_text(encoding='utf-8'))
     captures = captured_prompts(request_prefix, CONCURRENCY)
     delta = cache_delta(before, after)
     storage_delta = tier_delta(tier_before, tier_after)
+    storage_delta.update({
+        'dram_allocated_before': tier_before.get('dram_allocated_bytes'),
+        'dram_allocated_after': tier_after.get('dram_allocated_bytes'),
+        'ssd_allocated_before': tier_before.get('ssd_allocated_bytes'),
+        'ssd_allocated_after': tier_after.get('ssd_allocated_bytes'),
+        'runtime_read_bytes': (
+            runtime_reads_after - runtime_reads_before
+            if runtime_reads_before is not None and runtime_reads_after is not None
+            else None
+        ),
+    })
     storage_delta['ssd_device_read_bytes'] = (
         device_reads_after - device_reads_before
         if device_reads_before is not None and device_reads_after is not None
@@ -696,7 +750,7 @@ def run_stage(vllm, stage, batch, seed, expected_entries, reset_evidence=''):
     else:
         identity_valid = sorted(hashes) == sorted((item['prompt_sha256'] for item in expected_entries))
     successful = completed == CONCURRENCY
-    cache_ok, cache_reason = cache_valid(stage, delta, storage_delta)
+    cache_ok, cache_reason = cache_valid(stage, delta, storage_delta, transition_verified)
     valid = successful and input_valid and identity_valid and cache_ok
     reason_parts = [cache_reason]
     if not successful:
@@ -733,12 +787,13 @@ def validation_row(stage_result):
         'yes' if stage_result['identity_valid'] else 'no', 'yes' if stage_result['input_valid'] else 'no',
         local['queries'] if local else '', local['hits'] if local else '', rate_text(local['rate'] if local else None),
         external['queries'] if external else '', external['hits'] if external else '', rate_text(external['rate'] if external else None),
-        tier_value('valid_gets'), tier_value('dram_hits'), tier_value('dram_hit_bytes'), tier_value('ssd_hits'),
-        tier_value('ssd_hit_bytes'), tier_value('ssd_device_read_bytes'), stage_result['source'],
+        tier_value('dram_allocated_before'), tier_value('dram_allocated_after'),
+        tier_value('ssd_allocated_before'), tier_value('ssd_allocated_after'),
+        tier_value('runtime_read_bytes'), tier_value('ssd_device_read_bytes'), stage_result['source'],
         'yes' if stage_result['valid'] else 'no', stage_result['reason'], stage_result['reset_evidence'],
     ]
 RAW_HEADER = ['stage', 'concurrency', 'batch', 'prompt_id', 'request_index', 'seed', 'ttft_seconds', 'input_tokens', 'output_tokens', 'prompt_sha256', 'token_sha256', 'first_block_sha256', 'output_text', 'source', 'valid_request', 'error', 'result_file']
-VALIDATION_HEADER = ['concurrency', 'batch', 'stage', 'completed', 'failed', 'prompt_identity_valid', 'input_length_valid', 'local_queries', 'local_hits', 'local_rate', 'external_queries', 'external_hits', 'external_rate', 'mooncake_valid_gets', 'mooncake_dram_hits', 'mooncake_dram_hit_bytes', 'mooncake_ssd_hits', 'mooncake_ssd_hit_bytes', 'ssd_device_read_bytes', 'source', 'valid_batch', 'reason', 'reset_evidence']
+VALIDATION_HEADER = ['concurrency', 'batch', 'stage', 'completed', 'failed', 'prompt_identity_valid', 'input_length_valid', 'local_queries', 'local_hits', 'local_rate', 'external_queries', 'external_hits', 'external_rate', 'dram_allocated_before', 'dram_allocated_after', 'ssd_allocated_before', 'ssd_allocated_after', 'runtime_read_bytes', 'ssd_device_read_bytes', 'source', 'valid_batch', 'reason', 'reset_evidence']
 
 def col_name(index):
     name = ''
@@ -914,7 +969,7 @@ def prepare_session():
         'input_tokens': INPUT_LEN, 'block_size': BLOCK_SIZE, 'batches': BATCHES,
         'expected_concurrencies': EXPECTED_CONCURRENCIES,
         'storage_tiers': ['HBM', 'DRAM', 'SSD'],
-        'tier_evidence': 'vLLM local/external token counters + Mooncake DRAM/SSD hit/byte/valid-get counters + SSD block-device read sectors',
+        'tier_evidence': 'vLLM local/external token counters + Mooncake DRAM/SSD allocated bytes + benchmark runtime /proc read_bytes + SSD block-device read sectors',
         'required_source_hit_rate': REQUIRED_SOURCE_HIT_RATE,
         'ssd_offload_path': storage_config.get('ssd_offload_path'),
         'ssd_device': storage_config.get('benchmark_ssd_block_source') or storage_config.get('benchmark_ssd_source'),
@@ -929,7 +984,7 @@ def prepare_session():
     return session
 
 def verify_preconditions():
-    global SSD_BLOCK_STAT
+    global SSD_BLOCK_STAT, RUNTIME_ROOT_PID
     metrics = cache_metrics()
     if metrics['local'] is None or metrics['external'] is None:
         sys.exit('local/external prefix-cache counters are unavailable on /metrics')
@@ -949,13 +1004,14 @@ def verify_preconditions():
     SSD_BLOCK_STAT = Path(stat_override) if stat_override else Path('/sys/class/block') / ssd_kname / 'stat'
     if ssd_device_read_bytes() is None:
         sys.exit(f'SSD block-device read counter is unavailable: {SSD_BLOCK_STAT}')
+    RUNTIME_ROOT_PID = int(config.get('benchmark_startup_pid') or 0)
+    if runtime_read_bytes() is None:
+        sys.exit(f'benchmark runtime process-tree read counter is unavailable: root PID {RUNTIME_ROOT_PID}')
     ssd_path = config.get('ssd_offload_path')
     if not ssd_path or not Path(ssd_path).is_absolute() or not Path(ssd_path).is_dir():
         sys.exit(f'invalid or missing SSD offload directory: {ssd_path!r}')
-    tiers = tier_metrics()
-    missing = [name for name, value in tiers.items() if value is None]
-    if missing:
-        sys.exit(f'Mooncake tier metrics unavailable at {MOONCAKE_PROMETHEUS_URL}: {missing}')
+    # Mooncake 0.3.11 omits unchanged zero-valued metrics.  Allocation metrics
+    # are therefore validated after R1 has actually stored data.
 discover_model()
 verify_preconditions()
 session = prepare_session()
@@ -982,9 +1038,9 @@ def record_result(result, entries):
     print(
         f"  {result['stage']:<16} KV来源={result['source']:<13} "
         f"local={rate_text(local['rate'] if local else None):>7} external={rate_text(external['rate'] if external else None):>7} "
-        f"Mooncake[DRAM hits/bytes={tier.get('dram_hits')}/{tier.get('dram_hit_bytes')}, "
-        f"SSD hits/bytes={tier.get('ssd_hits')}/{tier.get('ssd_hit_bytes')}, "
-        f"physical reads={tier.get('ssd_device_read_bytes')}] "
+        f"Mooncake[DRAM allocated={tier.get('dram_allocated_after')}, "
+        f"SSD allocated={tier.get('ssd_allocated_after')}, "
+        f"runtime/NVMe reads={tier.get('runtime_read_bytes')}/{tier.get('ssd_device_read_bytes')}] "
         f"依据: {result['reason']} {('VALID' if result['valid'] else 'EXCLUDED')}"
     )
 
@@ -997,7 +1053,7 @@ try:
         print(f'\nC{CONCURRENCY} batch {batch}/{BATCHES}; seed={seed}')
         pre_r1_reset = reset_local('pre-R1 local reset')
         keys_before = mooncake_keys()
-        ssd_objects_before = tier_metrics()['ssd_objects']
+        ssd_bytes_before = tier_metrics()['ssd_allocated_bytes'] or 0
         r1 = run_stage(vllm, 'R1-warmup', batch, seed, None, reset_evidence=pre_r1_reset)
         entries = add_manifest_batch(manifest, batch, seed, r1['captures'])
         expected_hashes = [entry['prompt_sha256'] for entry in entries]
@@ -1006,9 +1062,8 @@ try:
         if not r1['identity_valid']:
             r1['reason'] += '; manifest hash mismatch'
         keys_after_r1 = wait_mooncake_settle(keys_before)
-        p1_objects = max(int(keys_after_r1 - keys_before), 1)
-        ssd_objects_after = wait_ssd_replicas(ssd_objects_before, p1_objects)
-        r1['reset_evidence'] += f'; Mooncake stable Keys {keys_before} -> {keys_after_r1}; eager SSD replicas {ssd_objects_before:g} -> {ssd_objects_after:g}'
+        ssd_bytes_after = wait_ssd_replicas(ssd_bytes_before)
+        r1['reset_evidence'] += f'; Mooncake stable Keys {keys_before} -> {keys_after_r1}; eager SSD allocated bytes {ssd_bytes_before:g} -> {ssd_bytes_after:g}'
         r2 = run_stage(vllm, 'R2-hbm-cache', batch, seed, entries)
         pre_r3_reset = reset_local('pre-R3 local reset')
         r3 = run_stage(vllm, 'R3-dram-cache', batch, seed, entries, reset_evidence=pre_r3_reset)
@@ -1016,16 +1071,15 @@ try:
             record_result(result, entries)
         batch_contexts.append((batch, seed, entries))
 
-    # Phase B: evict every object that was in DRAM before pressure.  Since
-    # pressure objects have newer leases, the pre-pressure set (including all
-    # P1 still in memory) is exhausted before R4.  R4 tier counters remain the
-    # final authority and reject any unexpected DRAM/mixed read.
+    # Phase B: evict at least the complete pre-pressure DRAM byte volume.
+    # Pressure objects have newer leases, so the expired P1 working set is
+    # exhausted first. R4 process/device physical-I/O is the final authority.
     print(f'\nC{CONCURRENCY} SSD transition: evicting the complete pre-pressure DRAM working set')
     eviction_evidence = evict_all_current_dram(vllm)
     for batch, seed, entries in batch_contexts:
         print(f'\nC{CONCURRENCY} batch {batch}/{BATCHES}; R4 SSD verification')
         pre_r4_reset = reset_local('pre-R4 local reset after SSD pressure')
-        r4 = run_stage(vllm, 'R4-ssd-cache', batch, seed, entries, reset_evidence=f'{pre_r4_reset}; {eviction_evidence}')
+        r4 = run_stage(vllm, 'R4-ssd-cache', batch, seed, entries, reset_evidence=f'{pre_r4_reset}; {eviction_evidence}', transition_verified=True)
         record_result(r4, entries)
 finally:
     proxy.shutdown()

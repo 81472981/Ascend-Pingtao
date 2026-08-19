@@ -302,6 +302,7 @@ mooncake_master --port $MASTER_PORT \
   --enable_offload=true \
   --offload_on_evict=false \
   --promotion_on_hit=false \
+  --enable_metric_reporting=true \
   --client_ttl=120 \
   > /tmp/mooncake_master.log 2>&1 &
 MASTER_PID=$!
@@ -311,13 +312,7 @@ sleep 3
 if curl -s -m 2 http://127.0.0.1:$METRICS_PORT/health > /dev/null 2>&1; then
   echo "mooncake_master 启动成功"
   echo "初始状态: $(curl -s http://127.0.0.1:$METRICS_PORT/metrics/summary | grep -o 'Mem Storage: [^|]*| SSD Storage: [^|]*| Keys: [0-9]*' | head -1)"
-  MASTER_METRICS=$(curl -s http://127.0.0.1:$METRICS_PORT/metrics)
-  for metric in mem_cache_hit_nums_ file_cache_hit_nums_ mem_cache_hit_bytes_total file_cache_hit_bytes_total mem_cache_nums_ file_cache_nums_ valid_get_nums_ master_evicted_key_count_mem; do
-    if ! printf '%s\n' "$MASTER_METRICS" | grep -q "^${metric}[{ ]"; then
-      echo "错误：Mooncake 缺少 SSD 可靠性校验指标 ${metric}；不能运行正式 SSD 评测"
-      exit 1
-    fi
-  done
+  echo "可靠性校验: Mooncake DRAM/SSD 分配量 + 评测进程树物理读盘 + NVMe 块设备读盘（Run-all 逐阶段强校验）"
 else
   echo "错误：mooncake_master 启动失败，查看日志："
   tail -20 /tmp/mooncake_master.log

@@ -41,10 +41,15 @@ class FakeState:
         self.dram_objects = 0
         self.ssd_objects = 0
         self.dram_evicted_objects = 0
+        self.dram_allocated_bytes = 0
+        self.ssd_allocated_bytes = 0
+        self.evicted_bytes = 0
         self.valid_gets = 0
         self.r4_tier = "ssd"
         self.block_stat_path: Path | None = None
+        self.runtime_read_path: Path | None = None
         self.ssd_read_sectors = 0
+        self.runtime_read_bytes = 0
 
 
 class DramHandler(http.server.BaseHTTPRequestHandler):
@@ -83,15 +88,10 @@ class DramHandler(http.server.BaseHTTPRequestHandler):
         if path == "/mooncake/metrics":
             with self.state.lock:
                 text = (
-                    f"mem_cache_hit_nums_ {self.state.dram_hits}\n"
-                    f"file_cache_hit_nums_ {self.state.ssd_hits}\n"
-                    f"mem_cache_hit_bytes_total {self.state.dram_hit_bytes}\n"
-                    f"file_cache_hit_bytes_total {self.state.ssd_hit_bytes}\n"
-                    f"mem_cache_nums_ {self.state.dram_objects}\n"
-                    f"file_cache_nums_ {self.state.ssd_objects}\n"
-                    f"valid_get_nums_ {self.state.valid_gets}\n"
-                    "master_successful_evictions_mem 0\n"
-                    f"master_evicted_key_count_mem {self.state.dram_evicted_objects}\n"
+                    f"master_allocated_bytes {self.state.dram_allocated_bytes}\n"
+                    f"master_allocated_file_size_bytes {self.state.ssd_allocated_bytes}\n"
+                    f"master_evicted_size_bytes {self.state.evicted_bytes}\n"
+                    f"master_evicted_key_count {self.state.dram_evicted_objects}\n"
                 )
             self.send_bytes(text.encode(), "text/plain")
             return
@@ -127,6 +127,8 @@ class DramHandler(http.server.BaseHTTPRequestHandler):
                     self.state.keys += 1
                     self.state.dram_objects += 1
                     self.state.ssd_objects += 1
+                    self.state.dram_allocated_bytes += 8192
+                    self.state.ssd_allocated_bytes += 8192
                 elif "-r2-" in request_id:
                     self.state.local_hits += cacheable_tokens
                     self.state.external_hits += cacheable_tokens
@@ -141,10 +143,15 @@ class DramHandler(http.server.BaseHTTPRequestHandler):
                         self.state.ssd_hits += 1
                         self.state.ssd_hit_bytes += cacheable_tokens
                         self.state.ssd_read_sectors += 32
+                        self.state.runtime_read_bytes += 16 * 1024
                         if self.state.block_stat_path is not None:
                             self.state.block_stat_path.write_text(
                                 f"0 0 {self.state.ssd_read_sectors} 0 0 0 0 0 0 0 0\n",
                                 encoding="ascii",
+                            )
+                        if self.state.runtime_read_path is not None:
+                            self.state.runtime_read_path.write_text(
+                                str(self.state.runtime_read_bytes), encoding="ascii"
                             )
                     else:
                         self.state.dram_hits += 1
@@ -154,7 +161,11 @@ class DramHandler(http.server.BaseHTTPRequestHandler):
                     self.state.keys += 1
                     self.state.ssd_objects += 1
                     self.state.dram_evicted_objects += 1
+                    self.state.evicted_bytes += 8192
                     self.state.dram_objects = max(0, self.state.dram_objects - 1)
+                    self.state.dram_allocated_bytes = max(
+                        0, self.state.dram_allocated_bytes - 8192
+                    )
             self.send_bytes(b'{"choices":[{"text":"x"}]}')
             return
         self.send_error(404)
@@ -322,7 +333,10 @@ class DramPrefixCacheTest(unittest.TestCase):
                 ssd_path.mkdir()
                 block_stat = root / "ssd-stat"
                 block_stat.write_text("0 0 0 0 0 0 0 0 0 0 0\n", encoding="ascii")
+                runtime_read = root / "runtime-read-bytes"
+                runtime_read.write_text("0", encoding="ascii")
                 state.block_stat_path = block_stat
+                state.runtime_read_path = runtime_read
                 config.write_text(
                     json.dumps(
                         {
@@ -352,6 +366,7 @@ class DramPrefixCacheTest(unittest.TestCase):
                         ),
                         "MOONCAKE_CONFIG_PATH": str(config),
                         "VB_SSD_BLOCK_STAT_PATH": str(block_stat),
+                        "VB_RUNTIME_READ_BYTES_PATH": str(runtime_read),
                         "VB_BATCHES": "1",
                         "VB_STORE_STABLE_SECONDS": "0",
                         "VB_STORE_TIMEOUT_SECONDS": "5",
@@ -475,7 +490,10 @@ class DramPrefixCacheTest(unittest.TestCase):
                 ssd_path.mkdir()
                 block_stat = root / "ssd-stat"
                 block_stat.write_text("0 0 0 0 0 0 0 0 0 0 0\n", encoding="ascii")
+                runtime_read = root / "runtime-read-bytes"
+                runtime_read.write_text("0", encoding="ascii")
                 state.block_stat_path = block_stat
+                state.runtime_read_path = runtime_read
                 config = root / "mooncake.json"
                 config.write_text(
                     json.dumps(
@@ -505,6 +523,7 @@ class DramPrefixCacheTest(unittest.TestCase):
                         ),
                         "MOONCAKE_CONFIG_PATH": str(config),
                         "VB_SSD_BLOCK_STAT_PATH": str(block_stat),
+                        "VB_RUNTIME_READ_BYTES_PATH": str(runtime_read),
                         "VB_RUN_DIR": str(root / "results"),
                         "VB_BATCHES": "1",
                         "VB_EXPECT_CONCURRENCIES": "1",
