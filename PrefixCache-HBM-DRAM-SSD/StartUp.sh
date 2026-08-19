@@ -24,6 +24,10 @@ SSD_PROBE_BYTES=$((256 * 1024 * 1024))
 # Mooncake 为每个 rank 注册的主机 DRAM 段；要求按 1GB 对齐。
 # 默认 256GB，也可在启动前用 MOONCAKE_SEGMENT_GB=... 覆盖。
 MOONCAKE_SEGMENT_GB="${MOONCAKE_SEGMENT_GB:-256}"
+# 16K P1 只需略高于 16384 的上下文。保留适量 NPU 余量，避免 int8 KV
+# Cache 建池时因 0.9 目标过紧触发 aclrtMallocPhysical 507899。
+VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-20000}"
+VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
 
 for size_value in "$MOONCAKE_SEGMENT_GB" "$SSD_BUFFER_GB" "$SSD_QUOTA_GB"; do
   case "$size_value" in
@@ -37,6 +41,17 @@ for size_value in "$MOONCAKE_SEGMENT_GB" "$SSD_BUFFER_GB" "$SSD_QUOTA_GB"; do
     exit 1
   fi
 done
+case "$VLLM_MAX_MODEL_LEN" in
+  ''|*[!0-9]*) echo "错误：VLLM_MAX_MODEL_LEN 必须是整数"; exit 1 ;;
+esac
+if [ "$VLLM_MAX_MODEL_LEN" -le 16384 ]; then
+  echo "错误：VLLM_MAX_MODEL_LEN 必须大于默认测试输入 16384"
+  exit 1
+fi
+if ! awk -v value="$VLLM_GPU_MEMORY_UTILIZATION" 'BEGIN { exit !(value > 0 && value < 1) }'; then
+  echo "错误：VLLM_GPU_MEMORY_UTILIZATION 必须是 0 到 1 之间的小数"
+  exit 1
+fi
 
 while [ "$SSD_ROOT" != "/" ] && [ "${SSD_ROOT%/}" != "$SSD_ROOT" ]; do
   SSD_ROOT="${SSD_ROOT%/}"
@@ -253,6 +268,8 @@ export GLOO_SOCKET_IFNAME=eth0
 export TP_SOCKET_IFNAME=eth0
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10
+# Ascend 官方建议用可扩展段缓解 KV Cache 初始化时的 NPU 显存碎片。
+export PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}"
 # Enable the benchmark-only /reset_prefix_cache endpoint. Run-all uses it with
 # reset_connector=false, so only HBM is cleared and Mooncake DRAM is retained.
 export VLLM_SERVER_DEV_MODE=1
@@ -321,6 +338,7 @@ fi
 
 echo ""
 echo "===== [5/5] 启动 vLLM ====="
+echo "NPU 显存配置: max-model-len=$VLLM_MAX_MODEL_LEN gpu-memory-utilization=$VLLM_GPU_MEMORY_UTILIZATION PYTORCH_NPU_ALLOC_CONF=$PYTORCH_NPU_ALLOC_CONF"
 vllm serve "$MODEL_PATH" \
   --port "$PORT" \
   --trust-remote-code \
@@ -328,8 +346,8 @@ vllm serve "$MODEL_PATH" \
   --block-size 128 \
   --enable-prefix-caching \
   --tensor-parallel-size 1 \
-  --max-model-len 32768 \
-  --gpu-memory-utilization 0.9 \
+  --max-model-len "$VLLM_MAX_MODEL_LEN" \
+  --gpu-memory-utilization "$VLLM_GPU_MEMORY_UTILIZATION" \
   --kv-transfer-config '{
     "kv_connector": "AscendStoreConnector",
     "kv_role": "kv_both",
