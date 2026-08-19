@@ -114,6 +114,8 @@ def main() -> None:
             base_ttft = 0.030
         elif "-r2.json" in result_filename:
             base_ttft = 0.010
+        elif "-r4.json" in result_filename:
+            base_ttft = 0.025
         else:
             base_ttft = 0.020
         ttfts = [base_ttft + index * 0.0001 for index in range(num_prompts)]

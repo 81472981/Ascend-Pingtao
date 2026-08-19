@@ -34,6 +34,17 @@ class FakeState:
         self.external_queries = 0
         self.external_hits = 0
         self.keys = 0
+        self.dram_hits = 0
+        self.ssd_hits = 0
+        self.dram_hit_bytes = 0
+        self.ssd_hit_bytes = 0
+        self.dram_objects = 0
+        self.ssd_objects = 0
+        self.dram_evicted_objects = 0
+        self.valid_gets = 0
+        self.r4_tier = "ssd"
+        self.block_stat_path: Path | None = None
+        self.ssd_read_sectors = 0
 
 
 class DramHandler(http.server.BaseHTTPRequestHandler):
@@ -69,6 +80,21 @@ class DramHandler(http.server.BaseHTTPRequestHandler):
                 )
             self.send_bytes(text.encode(), "text/plain")
             return
+        if path == "/mooncake/metrics":
+            with self.state.lock:
+                text = (
+                    f"mem_cache_hit_nums_ {self.state.dram_hits}\n"
+                    f"file_cache_hit_nums_ {self.state.ssd_hits}\n"
+                    f"mem_cache_hit_bytes_total {self.state.dram_hit_bytes}\n"
+                    f"file_cache_hit_bytes_total {self.state.ssd_hit_bytes}\n"
+                    f"mem_cache_nums_ {self.state.dram_objects}\n"
+                    f"file_cache_nums_ {self.state.ssd_objects}\n"
+                    f"valid_get_nums_ {self.state.valid_gets}\n"
+                    "master_successful_evictions_mem 0\n"
+                    f"master_evicted_key_count_mem {self.state.dram_evicted_objects}\n"
+                )
+            self.send_bytes(text.encode(), "text/plain")
+            return
         if path == "/metrics/summary":
             with self.state.lock:
                 text = f"Mem Storage: fake | Keys: {self.state.keys}"
@@ -99,11 +125,36 @@ class DramHandler(http.server.BaseHTTPRequestHandler):
                 self.state.external_queries += prompt_tokens
                 if "-r1-" in request_id:
                     self.state.keys += 1
+                    self.state.dram_objects += 1
+                    self.state.ssd_objects += 1
                 elif "-r2-" in request_id:
                     self.state.local_hits += cacheable_tokens
                     self.state.external_hits += cacheable_tokens
                 elif "-r3-" in request_id:
                     self.state.external_hits += cacheable_tokens
+                    self.state.dram_hits += 1
+                    self.state.dram_hit_bytes += cacheable_tokens
+                    self.state.valid_gets += 1
+                elif "-r4-" in request_id:
+                    self.state.external_hits += cacheable_tokens
+                    if self.state.r4_tier == "ssd":
+                        self.state.ssd_hits += 1
+                        self.state.ssd_hit_bytes += cacheable_tokens
+                        self.state.ssd_read_sectors += 32
+                        if self.state.block_stat_path is not None:
+                            self.state.block_stat_path.write_text(
+                                f"0 0 {self.state.ssd_read_sectors} 0 0 0 0 0 0 0 0\n",
+                                encoding="ascii",
+                            )
+                    else:
+                        self.state.dram_hits += 1
+                        self.state.dram_hit_bytes += cacheable_tokens
+                    self.state.valid_gets += 1
+                elif request_id.startswith("ssd-pressure-"):
+                    self.state.keys += 1
+                    self.state.ssd_objects += 1
+                    self.state.dram_evicted_objects += 1
+                    self.state.dram_objects = max(0, self.state.dram_objects - 1)
             self.send_bytes(b'{"choices":[{"text":"x"}]}')
             return
         self.send_error(404)
@@ -257,7 +308,7 @@ class DramPrefixCacheTest(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
-    def test_run_all_merges_c1_c5_c10_in_one_session(self) -> None:
+    def test_run_all_validates_hbm_dram_and_ssd_in_one_session(self) -> None:
         state = FakeState()
         DramHandler.state = state
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), DramHandler)
@@ -267,8 +318,22 @@ class DramPrefixCacheTest(unittest.TestCase):
             with tempfile.TemporaryDirectory() as temp_dir:
                 root = Path(temp_dir)
                 config = root / "mooncake.json"
+                ssd_path = root / "ssd"
+                ssd_path.mkdir()
+                block_stat = root / "ssd-stat"
+                block_stat.write_text("0 0 0 0 0 0 0 0 0 0 0\n", encoding="ascii")
+                state.block_stat_path = block_stat
                 config.write_text(
-                    json.dumps({"enable_ssd_offload": False}), encoding="utf-8"
+                    json.dumps(
+                        {
+                            "enable_ssd_offload": True,
+                            "ssd_offload_path": str(ssd_path),
+                            "benchmark_ssd_verified": True,
+                            "benchmark_ssd_kname": "fake0",
+                            "benchmark_ssd_direct_io": True,
+                        }
+                    ),
+                    encoding="utf-8",
                 )
                 env = os.environ.copy()
                 env.pop("VB_RUN_DIR", None)
@@ -281,20 +346,23 @@ class DramPrefixCacheTest(unittest.TestCase):
                             f"http://127.0.0.1:{server.server_address[1]}"
                             "/metrics/summary"
                         ),
+                        "VB_MOONCAKE_PROMETHEUS_URL": (
+                            f"http://127.0.0.1:{server.server_address[1]}"
+                            "/mooncake/metrics"
+                        ),
                         "MOONCAKE_CONFIG_PATH": str(config),
+                        "VB_SSD_BLOCK_STAT_PATH": str(block_stat),
                         "VB_BATCHES": "1",
                         "VB_STORE_STABLE_SECONDS": "0",
                         "VB_STORE_TIMEOUT_SECONDS": "5",
+                        "VB_SSD_PRESSURE_CONCURRENCY": "2",
+                        "VB_SSD_PRESSURE_MAX_ROUNDS": "100",
+                        "VB_SSD_PRESSURE_TIMEOUT_SECONDS": "30",
+                        "VB_SSD_EVICTION_LEASE_WAIT_SECONDS": "0",
                         "TZ": "UTC",
                     }
                 )
                 run_all_text = RUN_ALL.read_text(encoding="utf-8")
-                c1_text = (RUN_ALL.parent / "C1").read_text(encoding="utf-8")
-                run_all_body = run_all_text.split("<<'PY'\n", 1)[1].rsplit(
-                    "\nPY", 1
-                )[0]
-                c1_body = c1_text.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
-                self.assertEqual(run_all_body, c1_body)
                 self.assertLess(len(run_all_text.encode("utf-8")), 64 * 1024)
                 self.assertLessEqual(
                     max(len(line.encode("utf-8")) for line in run_all_text.splitlines()),
@@ -334,28 +402,42 @@ class DramPrefixCacheTest(unittest.TestCase):
                 result_dir = result_roots[0]
                 self.assertEqual(
                     {path.name for path in result_dir.glob("C*-result.json")},
-                    {"C1-result.json", "C5-result.json", "C10-result.json"},
+                    {"C1-result.json", "C5-result.json", "C10-result.json", "C100-result.json"},
                 )
                 session = json.loads(
                     (result_dir / "session.json").read_text(encoding="utf-8")
                 )
-                self.assertEqual(session["completed_concurrencies"], [1, 5, 10])
+                self.assertEqual(session["completed_concurrencies"], [1, 5, 10, 100])
+                self.assertEqual(session["storage_tiers"], ["HBM", "DRAM", "SSD"])
+
+                c1_payload = json.loads(
+                    (result_dir / "C1-result.json").read_text(encoding="utf-8")
+                )
+                sources = {
+                    row[2]: (row[19], row[20])
+                    for row in c1_payload["validation_rows"]
+                }
+                self.assertEqual(sources["R1-warmup"], ("MISS", "yes"))
+                self.assertEqual(sources["R2-hbm-cache"], ("HBM", "yes"))
+                self.assertEqual(sources["R3-dram-cache"], ("DRAM", "yes"))
+                self.assertEqual(sources["R4-ssd-cache"], ("SSD", "yes"))
 
                 manifest = json.loads(
                     (result_dir / "p1-manifest.json").read_text(encoding="utf-8")
                 )
                 requests = list(manifest["requests"].values())
-                self.assertEqual(len(requests), 16)
-                self.assertEqual(len({row["prompt_sha256"] for row in requests}), 16)
+                self.assertEqual(len(requests), 116)
+                self.assertEqual(len({row["prompt_sha256"] for row in requests}), 116)
                 self.assertEqual(
-                    len({row["first_block_sha256"] for row in requests}), 16
+                    len({row["first_block_sha256"] for row in requests}), 116
                 )
 
                 workbook = result_dir / "vb-result.xlsx"
                 with zipfile.ZipFile(workbook) as archive:
                     self.assertIsNone(archive.testzip())
                     names = archive.read("xl/workbook.xml").decode()
-                    self.assertEqual(names.count("<sheet "), 6)
+                    self.assertEqual(names.count("<sheet "), 7)
+                    self.assertIn('name="R4-ssd-cache"', names)
                     self.assertIn("xl/sharedStrings.xml", archive.namelist())
                     for name in archive.namelist():
                         if name.endswith(".xml"):
@@ -365,16 +447,102 @@ class DramPrefixCacheTest(unittest.TestCase):
                 if openpyxl is not None:
                     loaded = openpyxl.load_workbook(workbook, read_only=True)
                     summary = loaded["Summary"]
-                    self.assertEqual(summary.max_row, 4)
+                    self.assertEqual(summary.max_row, 5)
                     self.assertEqual(
-                        [summary.cell(row=row, column=1).value for row in range(2, 5)],
-                        ["C1", "C5", "C10"],
+                        [summary.cell(row=row, column=1).value for row in range(2, 6)],
+                        ["C1", "C5", "C10", "C100"],
                     )
                     self.assertEqual(
-                        [summary.cell(row=row, column=7).value for row in range(2, 5)],
-                        ["3/3", "15/15", "30/30"],
+                        [summary.cell(row=row, column=12).value for row in range(2, 6)],
+                        ["4/4", "20/20", "40/40", "400/400"],
                     )
                     loaded.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_run_all_rejects_r4_when_mooncake_reports_dram(self) -> None:
+        state = FakeState()
+        state.r4_tier = "dram"
+        DramHandler.state = state
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), DramHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                ssd_path = root / "ssd"
+                ssd_path.mkdir()
+                block_stat = root / "ssd-stat"
+                block_stat.write_text("0 0 0 0 0 0 0 0 0 0 0\n", encoding="ascii")
+                state.block_stat_path = block_stat
+                config = root / "mooncake.json"
+                config.write_text(
+                    json.dumps(
+                        {
+                            "enable_ssd_offload": True,
+                            "ssd_offload_path": str(ssd_path),
+                            "benchmark_ssd_verified": True,
+                            "benchmark_ssd_kname": "fake0",
+                            "benchmark_ssd_direct_io": True,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                env = os.environ.copy()
+                env.update(
+                    {
+                        "VLLM_BIN": f"{sys.executable} {FAKE_VLLM}",
+                        "FAKE_VLLM_SEND_REQUESTS": "1",
+                        "VB_PORT": str(server.server_address[1]),
+                        "VB_MOONCAKE_METRICS_URL": (
+                            f"http://127.0.0.1:{server.server_address[1]}"
+                            "/metrics/summary"
+                        ),
+                        "VB_MOONCAKE_PROMETHEUS_URL": (
+                            f"http://127.0.0.1:{server.server_address[1]}"
+                            "/mooncake/metrics"
+                        ),
+                        "MOONCAKE_CONFIG_PATH": str(config),
+                        "VB_SSD_BLOCK_STAT_PATH": str(block_stat),
+                        "VB_RUN_DIR": str(root / "results"),
+                        "VB_BATCHES": "1",
+                        "VB_EXPECT_CONCURRENCIES": "1",
+                        "VB_STORE_STABLE_SECONDS": "0",
+                        "VB_STORE_TIMEOUT_SECONDS": "5",
+                        "VB_SSD_PRESSURE_CONCURRENCY": "1",
+                        "VB_SSD_PRESSURE_TIMEOUT_SECONDS": "30",
+                        "VB_SSD_EVICTION_LEASE_WAIT_SECONDS": "0",
+                    }
+                )
+                run_all_text = RUN_ALL.read_text(encoding="utf-8")
+                single_c1 = run_all_text.rsplit("\nrun_concurrency 1 1", 1)[0]
+                single_c1 += "\nrun_concurrency 1 1\n"
+                completed = subprocess.run(
+                    ["bash", "-s"],
+                    input=single_c1,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    env=env,
+                    cwd=REPO_ROOT,
+                    timeout=60,
+                )
+                self.assertEqual(completed.returncode, 2)
+                self.assertIn("R4-ssd-cache", completed.stdout)
+                self.assertIn("KV来源=DRAM", completed.stdout)
+                payload = json.loads(
+                    (root / "results" / "C1-result.json").read_text(encoding="utf-8")
+                )
+                self.assertIsNone(
+                    payload["stage_summary"]["R4-ssd-cache"]["avg_ttft_seconds"]
+                )
+                r4_validation = next(
+                    row
+                    for row in payload["validation_rows"]
+                    if row[2] == "R4-ssd-cache"
+                )
+                self.assertEqual(r4_validation[20], "no")
         finally:
             server.shutdown()
             server.server_close()
