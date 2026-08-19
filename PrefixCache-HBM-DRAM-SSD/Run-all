@@ -40,19 +40,26 @@ if not config.get('benchmark_cleanup_managed'):
     print('Cleanup skipped: StartUp.sh does not manage this runtime')
     raise SystemExit(0)
 pid = int(config.get('benchmark_startup_pid') or 0)
+expected_start_ticks = str(config.get('benchmark_startup_start_ticks') or '')
 ssd_path = Path(config.get('ssd_offload_path') or '')
 if pid <= 1 or not ssd_path.is_absolute() or not ssd_path.name.startswith('session-'):
     raise SystemExit(f'Refusing unsafe cleanup request: pid={pid}, ssd_path={ssd_path}')
-cmdline_path = Path(f'/proc/{pid}/cmdline')
 try:
-    cmdline = cmdline_path.read_bytes().replace(b'\0', b' ')
+    stat_text = Path(f'/proc/{pid}/stat').read_text(encoding='ascii')
 except OSError as error:
     if not ssd_path.exists():
         print(f'SSD KV Cache already released: {ssd_path}')
         raise SystemExit(0)
     raise SystemExit(f'Cannot verify StartUp.sh process {pid}: {error}')
-if b'StartUp.sh' not in cmdline:
-    raise SystemExit(f'Refusing to signal PID {pid}; it is not StartUp.sh: {cmdline!r}')
+stat_tail = stat_text[stat_text.rfind(')') + 2:].split()
+current_start_ticks = stat_tail[19] if len(stat_tail) > 19 else ''
+if expected_start_ticks:
+    if current_start_ticks != expected_start_ticks:
+        raise SystemExit(f'Refusing reused PID {pid}: process start time changed')
+else:
+    cmdline = Path(f'/proc/{pid}/cmdline').read_bytes().replace(b'\0', b' ')
+    if b'StartUp.sh' not in cmdline:
+        raise SystemExit(f'Refusing to signal PID {pid}; it is not StartUp.sh: {cmdline!r}')
 print(f'Stopping benchmark runtime; StartUp.sh will release SSD KV Cache: {ssd_path}')
 os.kill(pid, signal.SIGTERM)
 deadline = time.monotonic() + 120

@@ -1,5 +1,13 @@
 #!/bin/bash
+(
 set -e
+
+# 外层子 Shell 使完整脚本可以直接粘贴到登录终端；exit/trap 不会退出 SSH Shell。
+STARTUP_PID="${BASHPID:-$$}"
+STARTUP_START_TICKS=""
+if [ -r "/proc/$STARTUP_PID/stat" ]; then
+  STARTUP_START_TICKS=$(awk '{print $22}' "/proc/$STARTUP_PID/stat")
+fi
 
 SERVED_NAME="Qwen3-8B"
 MODEL_PATH="/mnt/weight/${SERVED_NAME}"
@@ -43,7 +51,7 @@ if [ "$SSD_ROOT" = "/" ] || [ -L "$SSD_ROOT" ]; then
   exit 1
 fi
 mkdir -p "$SSD_ROOT"
-SSD_SESSION_PATH="$SSD_ROOT/session-$(date '+%Y%m%d-%H%M%S')-$$"
+SSD_SESSION_PATH="$SSD_ROOT/session-$(date '+%Y%m%d-%H%M%S')-$STARTUP_PID"
 mkdir -p "$SSD_SESSION_PATH"
 MASTER_PID=""
 VLLM_PID=""
@@ -200,7 +208,7 @@ if [ "$SSD_OVERLAY_MODE" = true ]; then
     echo "错误：容器 overlay 验证需要 dd 的 O_DIRECT 支持"
     exit 1
   fi
-  SSD_PROBE_PATH="$SSD_SESSION_PATH/.ssd-device-probe-$$"
+  SSD_PROBE_PATH="$SSD_SESSION_PATH/.ssd-device-probe-$STARTUP_PID"
   read -r probe_read_before probe_write_before < <(awk '{printf "%.0f %.0f\n", $3 * 512, $7 * 512}' "/sys/class/block/$SSD_KNAME/stat")
   if ! dd if=/dev/zero of="$SSD_PROBE_PATH" bs=4M count=64 oflag=direct conv=fsync status=none; then
     echo "错误：overlay 路径不支持 O_DIRECT 写入，不能可靠用作 SSD offload"
@@ -279,7 +287,8 @@ cat > $MOONCAKE_JSON <<EOF
   "benchmark_ssd_direct_io": true,
   "benchmark_ssd_overlay_verified": $SSD_OVERLAY_MODE,
   "benchmark_cleanup_managed": true,
-  "benchmark_startup_pid": $$
+  "benchmark_startup_pid": $STARTUP_PID,
+  "benchmark_startup_start_ticks": "$STARTUP_START_TICKS"
 }
 EOF
 cat $MOONCAKE_JSON
@@ -338,3 +347,4 @@ vllm serve "$MODEL_PATH" \
   }' &
 VLLM_PID=$!
 wait "$VLLM_PID"
+)
