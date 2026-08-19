@@ -32,6 +32,9 @@ MOONCAKE_SEGMENT_GB="${MOONCAKE_SEGMENT_GB:-256}"
 # 保持与加入 SSD 前已经验证通过的 HBM/DRAM 基线一致。
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.9}"
+# Mooncake 0.3.12.post1 移除了 16K SSD 回填触发的 kMaxSliceSize 断言。
+# 正式评测固定使用该版本，避免 Python 元数据已升级但仍导入 CANN 内置旧库。
+MOONCAKE_REQUIRED_VERSION="${MOONCAKE_REQUIRED_VERSION:-0.3.12.post1}"
 
 for size_value in "$MOONCAKE_SEGMENT_GB" "$SSD_QUOTA_GB"; do
   case "$size_value" in
@@ -315,7 +318,59 @@ fi
 
 echo ""
 echo "===== [2/5] 环境变量 ====="
-export LD_LIBRARY_PATH=/usr/local/lib:/usr/local/Ascend/cann-9.0.1/python/site-packages/mooncake:$LD_LIBRARY_PATH
+PYTHON_REAL_BIN=$(readlink -f "$(command -v python3)")
+PYTHON_BIN_DIR=$(dirname "$PYTHON_REAL_BIN")
+MOONCAKE_PYTHON_SITE=$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
+MOONCAKE_PACKAGE_DIR="$MOONCAKE_PYTHON_SITE/mooncake"
+MOONCAKE_MASTER_BIN="$PYTHON_BIN_DIR/mooncake_master"
+if [ ! -f "$MOONCAKE_PACKAGE_DIR/store.so" ] || \
+   [ ! -f "$MOONCAKE_PACKAGE_DIR/libmooncake_store.so" ] || \
+   [ ! -x "$MOONCAKE_MASTER_BIN" ]; then
+  echo "错误：未找到完整的新版 Mooncake NPU wheel：$MOONCAKE_PACKAGE_DIR"
+  echo "请安装 mooncake-transfer-engine-npu==$MOONCAKE_REQUIRED_VERSION"
+  exit 1
+fi
+
+# 新 wheel 自带 Ascend transport 和全部 Mooncake 动态库。必须放在 /usr/local/lib
+# 及 CANN 内置旧 Mooncake 之前，防止新 Python 模块链接到旧 libmooncake_store.so。
+export PATH="$PYTHON_BIN_DIR:$PATH"
+export PYTHONPATH="$MOONCAKE_PYTHON_SITE${PYTHONPATH:+:$PYTHONPATH}"
+export LD_LIBRARY_PATH="$MOONCAKE_PACKAGE_DIR:/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+MOONCAKE_RUNTIME_INFO=$(python3 - <<'PY'
+import mooncake
+from importlib.metadata import version
+
+print(version("mooncake-transfer-engine-npu"))
+print(mooncake.__file__)
+PY
+)
+MOONCAKE_RUNTIME_VERSION=$(printf '%s\n' "$MOONCAKE_RUNTIME_INFO" | sed -n '1p')
+MOONCAKE_RUNTIME_PATH=$(printf '%s\n' "$MOONCAKE_RUNTIME_INFO" | sed -n '2p')
+if [ "$MOONCAKE_RUNTIME_VERSION" != "$MOONCAKE_REQUIRED_VERSION" ]; then
+  echo "错误：Mooncake 版本为 $MOONCAKE_RUNTIME_VERSION，要求 $MOONCAKE_REQUIRED_VERSION"
+  exit 1
+fi
+case "$MOONCAKE_RUNTIME_PATH" in
+  "$MOONCAKE_PACKAGE_DIR"/*) ;;
+  *)
+    echo "错误：仍在加载旧 Mooncake：$MOONCAKE_RUNTIME_PATH"
+    exit 1
+    ;;
+esac
+MOONCAKE_STORE_LINKS=$(ldd "$MOONCAKE_PACKAGE_DIR/store.so")
+if printf '%s\n' "$MOONCAKE_STORE_LINKS" | grep -q 'not found'; then
+  echo "错误：新版 Mooncake 存在未解析动态库："
+  printf '%s\n' "$MOONCAKE_STORE_LINKS" | grep 'not found'
+  exit 1
+fi
+MOONCAKE_STORE_LIBRARY=$(printf '%s\n' "$MOONCAKE_STORE_LINKS" | awk '$1 == "libmooncake_store.so" && $2 == "=>" {print $3; exit}')
+if [ -z "$MOONCAKE_STORE_LIBRARY" ] || \
+   [ "$(readlink -f "$MOONCAKE_STORE_LIBRARY")" != "$(readlink -f "$MOONCAKE_PACKAGE_DIR/libmooncake_store.so")" ]; then
+  echo "错误：store.so 未链接新版 libmooncake_store.so：${MOONCAKE_STORE_LIBRARY:-未找到}"
+  exit 1
+fi
+echo "Mooncake校验：版本=$MOONCAKE_RUNTIME_VERSION，Python/动态库=新版wheel"
 export PYTHONHASHSEED=0
 export ASCEND_RT_VISIBLE_DEVICES=0
 export TASK_QUEUE_ENABLE=1
@@ -493,7 +548,7 @@ cat $MOONCAKE_JSON
 
 echo ""
 echo "===== [4/5] 启动 mooncake_master ====="
-mooncake_master --port $MASTER_PORT \
+"$MOONCAKE_MASTER_BIN" --port $MASTER_PORT \
   --eviction_high_watermark_ratio 0.9 \
   --eviction_ratio 0.1 \
   --default_kv_lease_ttl 11000 \

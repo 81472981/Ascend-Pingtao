@@ -3,8 +3,10 @@
 已确认的软件版本（2026-08-19）：
 1、vLLM：0.23.0+empty；可编辑源码安装，路径 /vllm-workspace/vllm，提交 0fc695f。
 2、vLLM-Ascend：0.23.0rc1；可编辑源码安装，路径 /vllm-workspace/vllm-ascend。
-3、Mooncake：源码路径 /root/Mooncake，提交 e9c6107；未作为独立 Python 包安装。
-4、执行 mooncake_master --version 前需加载 Ascend 运行环境；否则会因找不到 ascend_transport.so 而无法输出版本。
+3、Mooncake：`mooncake-transfer-engine-npu==0.3.12.post1`，安装在当前 Python 的
+   site-packages。该版本移除了 16K SSD 回填触发的 `kMaxSliceSize` 断言。
+4、CANN 目录仍保留旧版 Mooncake。启动脚本必须将新版 site-packages、bin 和动态库
+   置于旧目录之前，并校验 `store.so` 实际链接到新版 `libmooncake_store.so`。
         请求序列统一16K，block-size统一128
 参考：02目录是做性能测试的两个脚本，验证是OK的，本项目可以参考。
 
