@@ -109,6 +109,7 @@ class FakeState:
         self.ssd_hit_bytes = 0
         self.dram_allocated_bytes = 0
         self.ssd_allocated_bytes = 0
+        self.r1_write_count = 0
         self.valid_gets = 0
         self.r4_tier = "ssd"
         self.block_stat_path: Path | None = None
@@ -225,8 +226,11 @@ class DramHandler(http.server.BaseHTTPRequestHandler):
                 if "-r1-" in request_id:
                     self.state.keys += 1
                     self.state.dram_allocated_bytes += 8192
-                    # Production persists 126 of 128 DRAM-accounted blocks.
-                    self.state.ssd_allocated_bytes += 8192 * 126 // 128
+                    # Later P1s can share SSD-resident KV blocks from an
+                    # earlier P1, so their new allocation can be smaller.
+                    self.state.r1_write_count += 1
+                    blocks = 126 if self.state.r1_write_count == 1 else 110
+                    self.state.ssd_allocated_bytes += 8192 * blocks // 128
                 elif "-r2-" in request_id:
                     self.state.local_hits += cacheable_tokens
                     self.state.external_hits += cacheable_tokens
@@ -519,8 +523,7 @@ class DramPrefixCacheTest(unittest.TestCase):
                     0,
                     msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
                 )
-                self.assertIn("SSD副本 | 实际", completed.stdout)
-                self.assertIn("最低", completed.stdout)
+                self.assertIn("SSD副本 | 新增", completed.stdout)
                 self.assertNotIn("not stable", completed.stderr)
 
                 result_roots = list((root / "vb-result").iterdir())
@@ -546,8 +549,6 @@ class DramPrefixCacheTest(unittest.TestCase):
                 )
                 self.assertEqual(session["completed_concurrencies"], [1, 5, 10, 100])
                 self.assertEqual(session["storage_tiers"], ["HBM", "DRAM", "SSD"])
-                self.assertEqual(session["ssd_replica_blocks"], 126)
-                self.assertEqual(session["ssd_replica_rate"], 126 / 128)
                 self.assertEqual(session["ssd_transition"]["mode"], "signal-request-v1")
                 runtime_status = dict(
                     line.split("=", 1)

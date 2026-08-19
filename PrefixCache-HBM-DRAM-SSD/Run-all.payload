@@ -162,13 +162,6 @@ if INPUT_LEN <= 0 or BLOCK_SIZE <= 0 or INPUT_LEN % BLOCK_SIZE:
 if RUNTIME_RESTART_TIMEOUT_SECONDS <= 0:
     sys.exit('VB_RUNTIME_RESTART_TIMEOUT_SECONDS must be positive')
 REQUIRED_SOURCE_HIT_RATE = max(MIN_HIT_RATE, (INPUT_LEN - BLOCK_SIZE) / INPUT_LEN - 1e-9)
-# The connector's leading boundary and the trailing compute boundary are
-# included in DRAM accounting but do not form reusable file-backend payload.
-# Keep the SSD completeness ratio independent from the token hit-rate ratio.
-SSD_REPLICA_BLOCKS = max(0, INPUT_LEN // BLOCK_SIZE - 2)
-SSD_REPLICA_RATE = SSD_REPLICA_BLOCKS * BLOCK_SIZE / INPUT_LEN
-if SSD_REPLICA_BLOCKS <= 0:
-    sys.exit('VB_INPUT_LEN must contain more than two cache blocks for SSD validation')
 CACHE_PAIRS = {'local': (('vllm:prefix_cache_queries_total', 'vllm:prefix_cache_hits_total'), ('vllm:prefix_cache_queries', 'vllm:prefix_cache_hits')), 'external': (('vllm:external_prefix_cache_queries_total', 'vllm:external_prefix_cache_hits_total'), ('vllm:external_prefix_cache_queries', 'vllm:external_prefix_cache_hits'))}
 TIER_METRIC_NAMES = {
     'dram_allocated_bytes': ('master_allocated_bytes',),
@@ -556,10 +549,27 @@ def wait_mooncake_settle(keys_before):
     read_value = lambda: (mooncake_keys(), tier_metrics().get('dram_allocated_bytes'))
     return wait_stable(read_value, lambda value: value[0] is not None and value[0] > (keys_before or 0) and value[1] is not None, 'Mooncake DRAM')
 
-def wait_ssd_replicas(ssd_bytes_before, minimum_increase):
-    read_value = lambda: tier_metrics().get('ssd_allocated_bytes')
-    reached = lambda value: value is not None and value - ssd_bytes_before >= minimum_increase > 0
-    return wait_stable(read_value, reached, f'SSD increase>={minimum_increase}')
+def wait_ssd_replicas(ssd_bytes_before):
+    deadline = time.monotonic() + STORE_TIMEOUT_SECONDS
+    last = stable = None
+    last_progress = time.monotonic()
+    while time.monotonic() < deadline:
+        current = tier_metrics().get('ssd_allocated_bytes')
+        if current is not None and current > ssd_bytes_before and current == last:
+            stable = stable or time.monotonic()
+            if time.monotonic() - stable >= STORE_STABLE_SECONDS:
+                return current
+        else:
+            stable = None
+        now = time.monotonic()
+        if now - last_progress >= 10:
+            added = max(0, (current or 0) - ssd_bytes_before)
+            print(f'  SSD副本等待 | 已新增{size_text(added)}，等待稳定')
+            last_progress = now
+        last = current
+        time.sleep(0.5)
+    added = max(0, (last or 0) - ssd_bytes_before)
+    raise RuntimeError(f'SSD did not create a stable new replica: added={added}')
 
 def completion_prompt(body):
     try:
@@ -1097,8 +1107,6 @@ def prepare_session():
         'storage_tiers': ['HBM', 'DRAM', 'SSD'],
         'tier_evidence': 'local/external counters + DRAM/SSD bytes + cache drop + process/NVMe reads',
         'required_source_hit_rate': REQUIRED_SOURCE_HIT_RATE,
-        'ssd_replica_blocks': SSD_REPLICA_BLOCKS,
-        'ssd_replica_rate': SSD_REPLICA_RATE,
         'ssd_offload_path': storage_config.get('ssd_offload_path'),
         'ssd_device': storage_config.get('benchmark_ssd_block_source') or storage_config.get('benchmark_ssd_source'),
         'ssd_fstype': storage_config.get('benchmark_ssd_fstype'),
@@ -1236,30 +1244,21 @@ try:
         r1['valid'] = r1['valid'] and r1['identity_valid']
         if not r1['identity_valid']:
             r1['reason'] += '; manifest hash mismatch'
-        print('  R1请求完成 | 正在校验DRAM与SSD副本')
+        print('  R1请求完成 | 等待SSD副本稳定')
         keys_after_r1, dram_bytes_after = wait_mooncake_settle(keys_before)
         if dram_bytes_after is None or dram_bytes_after <= dram_bytes_before:
             raise RuntimeError(
                 f'R1 did not create a measurable DRAM copy: {dram_bytes_before} -> {dram_bytes_after}'
             )
         batch_dram_bytes = int(dram_bytes_after - dram_bytes_before)
-        minimum_ssd_replica_bytes = (
-            batch_dram_bytes * SSD_REPLICA_BLOCKS
-            // (INPUT_LEN // BLOCK_SIZE)
-        )
-        ssd_bytes_after = wait_ssd_replicas(ssd_bytes_before, minimum_ssd_replica_bytes)
+        ssd_bytes_after = wait_ssd_replicas(ssd_bytes_before)
         batch_ssd_replica_bytes = int(ssd_bytes_after - ssd_bytes_before)
-        required_ssd_read_bytes = minimum_ssd_replica_bytes
-        print(
-            f'  SSD副本 | 实际{size_text(batch_ssd_replica_bytes)},'
-            f'最低{size_text(minimum_ssd_replica_bytes)} | OK'
-        )
+        required_ssd_read_bytes = batch_ssd_replica_bytes
+        print(f'  SSD副本 | 新增{size_text(batch_ssd_replica_bytes)} | OK')
         r1['reset_evidence'] += (
             f'; Mooncake stable Keys {keys_before} -> {keys_after_r1}; '
-            f'DRAM batch bytes={batch_dram_bytes}; eager SSD allocated bytes '
-            f'{ssd_bytes_before:g} -> {ssd_bytes_after:g}; SSD batch bytes={batch_ssd_replica_bytes} '
-            f'>= minimum {minimum_ssd_replica_bytes} ({SSD_REPLICA_BLOCKS}/'
-            f'{INPUT_LEN // BLOCK_SIZE} persistent blocks); '
+            f'DRAM batch bytes={batch_dram_bytes}; stable SSD allocated bytes '
+            f'{ssd_bytes_before:g} -> {ssd_bytes_after:g}; SSD batch bytes={batch_ssd_replica_bytes}; '
             f'R4 required physical read bytes={required_ssd_read_bytes}'
         )
         r2 = run_stage(vllm, 'R2-hbm-cache', batch, seed, entries)
