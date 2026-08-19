@@ -21,8 +21,7 @@ SSD_ROOT="${MOONCAKE_SSD_ROOT:-/mnt/mooncake-ssd-offload}"
 SSD_BUFFER_MB="${MOONCAKE_SSD_BUFFER_MB:-4096}"
 SSD_QUOTA_GB="${MOONCAKE_SSD_QUOTA_GB:-3072}"
 # A3 未启用 Fabric Memory 时，vLLM-Ascend/Mooncake 官方建议使用 NPU 中转
-# buffer。它会避免把超大的 DRAM 段和 SSD staging buffer 直接映射进 ADXL，
-# 防止后续 NPU KV Cache 的 aclrtMallocPhysical 因映射资源冲突而失败。
+# buffer。它会避免把超大的 DRAM 段和 SSD staging buffer 直接映射进 ADXL。
 ASCEND_TRANSFER_BUFFER_POOL="${MOONCAKE_ASCEND_BUFFER_POOL:-4:8}"
 # 当前评测容器的 overlay 位于 nvme3n1p1；其他环境仍可通过同名变量覆盖。
 SSD_BLOCK_DEVICE_OVERRIDE="${MOONCAKE_SSD_BLOCK_DEVICE:-/dev/nvme3n1p1}"
@@ -104,6 +103,7 @@ SSD_SESSION_PATH="$SSD_ROOT/session-$(date '+%Y%m%d-%H%M%S')-$STARTUP_PID"
 mkdir -p "$SSD_SESSION_PATH"
 MASTER_PID=""
 VLLM_PID=""
+VLLM_PATCH_DIR=""
 
 delete_ssd_session() {
   session_dir="$1"
@@ -141,6 +141,16 @@ cleanup_runtime() {
   if [ -n "$MASTER_PID" ]; then kill -KILL "$MASTER_PID" 2>/dev/null; fi
   if [ -n "$VLLM_PID" ]; then wait "$VLLM_PID" 2>/dev/null; fi
   if [ -n "$MASTER_PID" ]; then wait "$MASTER_PID" 2>/dev/null; fi
+  case "$VLLM_PATCH_DIR" in
+    /tmp/vllm-ssd-lazy-init.*)
+      if [ -d "$VLLM_PATCH_DIR" ]; then
+        find "$VLLM_PATCH_DIR" -xdev -depth -mindepth 1 -delete
+        rmdir "$VLLM_PATCH_DIR"
+      fi
+      ;;
+    '') ;;
+    *) echo "拒绝清理非预期的临时补丁目录：$VLLM_PATCH_DIR" ;;
+  esac
   if delete_ssd_session "$SSD_SESSION_PATH"; then
     echo "SSD KV Cache 已释放：${SSD_SESSION_PATH}；评测结果目录不受影响。"
   else
@@ -324,6 +334,119 @@ export ASCEND_BUFFER_POOL="$ASCEND_TRANSFER_BUFFER_POOL"
 # 与 ASCEND_BUFFER_POOL 不兼容，因此必须显式清除可能继承的环境变量。
 unset ASCEND_USE_ASYNC_TRANSFER
 export MOONCAKE_REQUESTER_LOCAL_HOSTNAME=192.168.243.40
+
+# vLLM-Ascend 0.23.0rc1 默认在 NPU KV tensor 分配前初始化 embedded
+# Mooncake。日志显示 SSD 模式额外执行 aclrtMallocHost/io_uring 注册后，本机驱动
+# 紧接着对第一个大 KV tensor 的 aclrtMallocPhysical 返回 507899。临时 import hook 仅将
+# contribute-memory worker 的 SSD store 延迟到 KV tensor 已分配并注册之后；
+# scheduler client、非 SSD 模式以及已安装源码都不改变。
+VLLM_PATCH_DIR=$(mktemp -d /tmp/vllm-ssd-lazy-init.XXXXXX)
+cat > "$VLLM_PATCH_DIR/sitecustomize.py" <<'PY'
+import importlib.abc
+import importlib.machinery
+import os
+import sys
+import threading
+
+
+_TARGET = (
+    "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store."
+    "backend.mooncake_backend"
+)
+
+
+class _MooncakeBackendPatchLoader(importlib.abc.Loader):
+    def __init__(self, wrapped_loader):
+        self._wrapped_loader = wrapped_loader
+
+    def create_module(self, spec):
+        create_module = getattr(self._wrapped_loader, "create_module", None)
+        return create_module(spec) if create_module is not None else None
+
+    def exec_module(self, module):
+        self._wrapped_loader.exec_module(module)
+        backend = module.MooncakeBackend
+        if getattr(backend, "_benchmark_ssd_init_order_patch", False):
+            return
+
+        original_register_buffer = backend.register_buffer
+
+        def patched_init(
+            self,
+            parallel_config,
+            lazy_init=False,
+            contribute_memory=True,
+        ):
+            self.parallel_config = parallel_config
+            self.config = module.MooncakeStoreConfig.load_from_env()
+            if self.config.protocol != "ascend":
+                raise NotImplementedError(
+                    "MooncakeBackend does not support protocol "
+                    f"{self.config.protocol!r}."
+                )
+
+            self.store = None
+            self.local_seg = None
+            self._use_fabric_mem = (
+                os.getenv("ASCEND_ENABLE_USE_FABRIC_MEM", "0") == "1"
+            )
+            # Preserve the upstream compress/Fabric behavior, and additionally
+            # defer only the SSD worker that contributes DRAM/SSD capacity.
+            self._lazy_init = (
+                lazy_init and self._use_fabric_mem
+            ) or (
+                contribute_memory and self.config.enable_ssd_offload
+            )
+            self._contribute_memory = contribute_memory
+            self._store_initialized = False
+            self._store_init_lock = threading.Lock()
+
+            if self._lazy_init and self.config.enable_ssd_offload:
+                module.logger.info(
+                    "SSD startup ordering patch active: defer Mooncake worker "
+                    "store until NPU KV cache allocation completes."
+                )
+            if not self._lazy_init:
+                self.store = self._setup_store()
+                self._store_initialized = True
+
+        def patched_register_buffer(self, ptrs, lengths):
+            # This callback is reached only after vLLM has successfully created
+            # all NPU KV cache tensors. Register them first, then allocate the
+            # Mooncake DRAM segment and SSD staging buffer.
+            original_register_buffer(self, ptrs, lengths)
+            if (
+                self._lazy_init
+                and not self._store_initialized
+                and self._contribute_memory
+                and self.config.enable_ssd_offload
+            ):
+                module.logger.info(
+                    "NPU KV cache allocated; initializing Mooncake DRAM/SSD now."
+                )
+                self.ensure_initialized()
+
+        backend.__init__ = patched_init
+        backend.register_buffer = patched_register_buffer
+        backend._benchmark_ssd_init_order_patch = True
+
+
+class _MooncakeBackendPatchFinder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != _TARGET:
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+        if spec is None or spec.loader is None or not hasattr(spec.loader, "exec_module"):
+            raise ImportError(f"Cannot install SSD startup ordering patch for {fullname}")
+        spec.loader = _MooncakeBackendPatchLoader(spec.loader)
+        return spec
+
+
+sys.meta_path.insert(0, _MooncakeBackendPatchFinder())
+PY
+python3 -m py_compile "$VLLM_PATCH_DIR/sitecustomize.py"
+export PYTHONPATH="$VLLM_PATCH_DIR${PYTHONPATH:+:$PYTHONPATH}"
+
 # Mooncake SSD offload：每次启动使用新的空目录，避免上次会话的数据污染冷启动。
 export MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=$((SSD_BUFFER_MB * 1024 * 1024))
 export MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE=$((SSD_QUOTA_GB * 1024 * 1024 * 1024))
@@ -387,7 +510,7 @@ fi
 
 echo ""
 echo "===== [5/5] 启动 vLLM ====="
-echo "配置: SSD staging buffer=${SSD_BUFFER_MB}MB；Ascend中转池=$ASCEND_BUFFER_POOL；max-model-len=$VLLM_MAX_MODEL_LEN；gpu-memory-utilization=$VLLM_GPU_MEMORY_UTILIZATION"
+echo "配置: SSD staging buffer=${SSD_BUFFER_MB}MB；Ascend中转池=$ASCEND_BUFFER_POOL；SSD初始化顺序=NPU-KV之后；max-model-len=$VLLM_MAX_MODEL_LEN；gpu-memory-utilization=$VLLM_GPU_MEMORY_UTILIZATION"
 vllm serve "$MODEL_PATH" \
   --port "$PORT" \
   --trust-remote-code \
