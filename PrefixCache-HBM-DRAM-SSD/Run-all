@@ -648,8 +648,8 @@ def evict_all_current_dram(vllm):
         last = tier_metrics()
         evicted = int((last['evicted_bytes'] or 0) - evicted_before)
         print(
-            f'  压力 {pressure_round:03d}: 淘汰 {size_text(evicted)}/{size_text(target)} '
-            f'D={size_text(last["dram_allocated_bytes"])} S={size_text(last["ssd_allocated_bytes"])}'
+            f'  第{pressure_round:03d}轮压力：已淘汰 {size_text(evicted)}（目标 {size_text(target)}）；'
+            f'主机内存缓存={size_text(last["dram_allocated_bytes"])}；固态硬盘缓存={size_text(last["ssd_allocated_bytes"])}'
         )
         if evicted >= target:
             return (
