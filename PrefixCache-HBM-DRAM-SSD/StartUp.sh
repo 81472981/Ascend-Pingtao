@@ -16,10 +16,14 @@ MOONCAKE_JSON=/tmp/mooncake.json
 MASTER_PORT=50088
 METRICS_PORT=9003
 SSD_ROOT="${MOONCAKE_SSD_ROOT:-/mnt/mooncake-ssd-offload}"
-# Mooncake 0.3.11 官方默认约 1.25GB。8GB aclrtMallocHost buffer 会导致
-# io_uring fixed-buffer 注册失败，并挤占 Ascend runtime 的映射资源。
-SSD_BUFFER_MB="${MOONCAKE_SSD_BUFFER_MB:-1280}"
+# Qwen3-8B 的单条 16K BF16 KV 约 2.25GB；接收线程逐请求读取，默认 4GB
+# 可覆盖单条 R4，同时避免为并发数重复预留 staging buffer。
+SSD_BUFFER_MB="${MOONCAKE_SSD_BUFFER_MB:-4096}"
 SSD_QUOTA_GB="${MOONCAKE_SSD_QUOTA_GB:-3072}"
+# A3 未启用 Fabric Memory 时，vLLM-Ascend/Mooncake 官方建议使用 NPU 中转
+# buffer。它会避免把超大的 DRAM 段和 SSD staging buffer 直接映射进 ADXL，
+# 防止后续 NPU KV Cache 的 aclrtMallocPhysical 因映射资源冲突而失败。
+ASCEND_TRANSFER_BUFFER_POOL="${MOONCAKE_ASCEND_BUFFER_POOL:-4:8}"
 # 当前评测容器的 overlay 位于 nvme3n1p1；其他环境仍可通过同名变量覆盖。
 SSD_BLOCK_DEVICE_OVERRIDE="${MOONCAKE_SSD_BLOCK_DEVICE:-/dev/nvme3n1p1}"
 SSD_PROBE_BYTES=$((256 * 1024 * 1024))
@@ -49,6 +53,28 @@ if [ "$SSD_BUFFER_MB" -eq 0 ]; then
   echo "错误：MOONCAKE_SSD_BUFFER_MB 必须大于 0MB"
   exit 1
 fi
+case "$ASCEND_TRANSFER_BUFFER_POOL" in
+  *:*)
+    buffer_pool_count="${ASCEND_TRANSFER_BUFFER_POOL%%:*}"
+    buffer_pool_size_mb="${ASCEND_TRANSFER_BUFFER_POOL#*:}"
+    ;;
+  *)
+    echo "错误：MOONCAKE_ASCEND_BUFFER_POOL 必须是 数量:大小MB，例如 4:8"
+    exit 1
+    ;;
+esac
+for buffer_pool_value in "$buffer_pool_count" "$buffer_pool_size_mb"; do
+  case "$buffer_pool_value" in
+    ''|*[!0-9]*)
+      echo "错误：MOONCAKE_ASCEND_BUFFER_POOL 必须是正整数:正整数，例如 4:8"
+      exit 1
+      ;;
+  esac
+  if [ "$buffer_pool_value" -eq 0 ]; then
+    echo "错误：MOONCAKE_ASCEND_BUFFER_POOL 不能关闭；A3 非 Fabric 模式需要中转 buffer"
+    exit 1
+  fi
+done
 case "$VLLM_MAX_MODEL_LEN" in
   ''|*[!0-9]*) echo "错误：VLLM_MAX_MODEL_LEN 必须是整数"; exit 1 ;;
 esac
@@ -290,6 +316,13 @@ export OMP_NUM_THREADS=10
 # reset_connector=false, so only HBM is cleared and Mooncake DRAM is retained.
 export VLLM_SERVER_DEV_MODE=1
 unset ASCEND_ENABLE_USE_FABRIC_MEM
+# 当前容器沿用加入 SSD 前的非 Fabric 路径。开启官方推荐的 4×8MB NPU
+# 中转池后，Mooncake 日志应出现 "Set adxl.BufferPool to:4:8"，并对 Host
+# 段打印 "Ignore register host mem ... when buffer pool is enabled"。
+export ASCEND_BUFFER_POOL="$ASCEND_TRANSFER_BUFFER_POOL"
+# Mooncake 只按变量是否存在判断异步传输；即使值为 0 也会启用，而异步模式
+# 与 ASCEND_BUFFER_POOL 不兼容，因此必须显式清除可能继承的环境变量。
+unset ASCEND_USE_ASYNC_TRANSFER
 export MOONCAKE_REQUESTER_LOCAL_HOSTNAME=192.168.243.40
 # Mooncake SSD offload：每次启动使用新的空目录，避免上次会话的数据污染冷启动。
 export MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=$((SSD_BUFFER_MB * 1024 * 1024))
@@ -354,7 +387,7 @@ fi
 
 echo ""
 echo "===== [5/5] 启动 vLLM ====="
-echo "配置: SSD staging buffer=${SSD_BUFFER_MB}MB；max-model-len=$VLLM_MAX_MODEL_LEN；gpu-memory-utilization=$VLLM_GPU_MEMORY_UTILIZATION"
+echo "配置: SSD staging buffer=${SSD_BUFFER_MB}MB；Ascend中转池=$ASCEND_BUFFER_POOL；max-model-len=$VLLM_MAX_MODEL_LEN；gpu-memory-utilization=$VLLM_GPU_MEMORY_UTILIZATION"
 vllm serve "$MODEL_PATH" \
   --port "$PORT" \
   --trust-remote-code \
