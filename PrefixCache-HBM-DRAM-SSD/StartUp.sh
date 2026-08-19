@@ -16,7 +16,9 @@ MOONCAKE_JSON=/tmp/mooncake.json
 MASTER_PORT=50088
 METRICS_PORT=9003
 SSD_ROOT="${MOONCAKE_SSD_ROOT:-/mnt/mooncake-ssd-offload}"
-SSD_BUFFER_GB="${MOONCAKE_SSD_BUFFER_GB:-8}"
+# Mooncake 0.3.11 官方默认约 1.25GB。8GB aclrtMallocHost buffer 会导致
+# io_uring fixed-buffer 注册失败，并挤占 Ascend runtime 的映射资源。
+SSD_BUFFER_MB="${MOONCAKE_SSD_BUFFER_MB:-1280}"
 SSD_QUOTA_GB="${MOONCAKE_SSD_QUOTA_GB:-3072}"
 # 当前评测容器的 overlay 位于 nvme3n1p1；其他环境仍可通过同名变量覆盖。
 SSD_BLOCK_DEVICE_OVERRIDE="${MOONCAKE_SSD_BLOCK_DEVICE:-/dev/nvme3n1p1}"
@@ -24,15 +26,14 @@ SSD_PROBE_BYTES=$((256 * 1024 * 1024))
 # Mooncake 为每个 rank 注册的主机 DRAM 段；要求按 1GB 对齐。
 # 默认 256GB，也可在启动前用 MOONCAKE_SEGMENT_GB=... 覆盖。
 MOONCAKE_SEGMENT_GB="${MOONCAKE_SEGMENT_GB:-256}"
-# 16K P1 只需略高于 16384 的上下文。保留适量 NPU 余量，避免 int8 KV
-# Cache 建池时因 0.9 目标过紧触发 aclrtMallocPhysical 507899。
-VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-20000}"
-VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
+# 保持与加入 SSD 前已经验证通过的 HBM/DRAM 基线一致。
+VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
+VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.9}"
 
-for size_value in "$MOONCAKE_SEGMENT_GB" "$SSD_BUFFER_GB" "$SSD_QUOTA_GB"; do
+for size_value in "$MOONCAKE_SEGMENT_GB" "$SSD_QUOTA_GB"; do
   case "$size_value" in
     ''|*[!0-9]*)
-      echo "错误：MOONCAKE_SEGMENT_GB、MOONCAKE_SSD_BUFFER_GB、MOONCAKE_SSD_QUOTA_GB 必须是整数 GB"
+      echo "错误：MOONCAKE_SEGMENT_GB、MOONCAKE_SSD_QUOTA_GB 必须是整数 GB"
       exit 1
       ;;
   esac
@@ -41,6 +42,13 @@ for size_value in "$MOONCAKE_SEGMENT_GB" "$SSD_BUFFER_GB" "$SSD_QUOTA_GB"; do
     exit 1
   fi
 done
+case "$SSD_BUFFER_MB" in
+  ''|*[!0-9]*) echo "错误：MOONCAKE_SSD_BUFFER_MB 必须是整数 MB"; exit 1 ;;
+esac
+if [ "$SSD_BUFFER_MB" -eq 0 ]; then
+  echo "错误：MOONCAKE_SSD_BUFFER_MB 必须大于 0MB"
+  exit 1
+fi
 case "$VLLM_MAX_MODEL_LEN" in
   ''|*[!0-9]*) echo "错误：VLLM_MAX_MODEL_LEN 必须是整数"; exit 1 ;;
 esac
@@ -278,15 +286,13 @@ export GLOO_SOCKET_IFNAME=eth0
 export TP_SOCKET_IFNAME=eth0
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10
-# Ascend 官方建议用可扩展段缓解 KV Cache 初始化时的 NPU 显存碎片。
-export PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}"
 # Enable the benchmark-only /reset_prefix_cache endpoint. Run-all uses it with
 # reset_connector=false, so only HBM is cleared and Mooncake DRAM is retained.
 export VLLM_SERVER_DEV_MODE=1
 unset ASCEND_ENABLE_USE_FABRIC_MEM
 export MOONCAKE_REQUESTER_LOCAL_HOSTNAME=192.168.243.40
 # Mooncake SSD offload：每次启动使用新的空目录，避免上次会话的数据污染冷启动。
-export MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=$((SSD_BUFFER_GB * 1024 * 1024 * 1024))
+export MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=$((SSD_BUFFER_MB * 1024 * 1024))
 export MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE=$((SSD_QUOTA_GB * 1024 * 1024 * 1024))
 export MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=$((SSD_QUOTA_GB * 1024 * 1024 * 1024))
 export MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY=none
@@ -348,7 +354,7 @@ fi
 
 echo ""
 echo "===== [5/5] 启动 vLLM ====="
-echo "NPU 显存配置: max-model-len=$VLLM_MAX_MODEL_LEN gpu-memory-utilization=$VLLM_GPU_MEMORY_UTILIZATION PYTORCH_NPU_ALLOC_CONF=$PYTORCH_NPU_ALLOC_CONF"
+echo "配置: SSD staging buffer=${SSD_BUFFER_MB}MB；max-model-len=$VLLM_MAX_MODEL_LEN；gpu-memory-utilization=$VLLM_GPU_MEMORY_UTILIZATION"
 vllm serve "$MODEL_PATH" \
   --port "$PORT" \
   --trust-remote-code \
