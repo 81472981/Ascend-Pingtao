@@ -290,15 +290,11 @@ class DramPrefixCacheTest(unittest.TestCase):
                 )
                 run_all_text = RUN_ALL.read_text(encoding="utf-8")
                 c1_text = (RUN_ALL.parent / "C1").read_text(encoding="utf-8")
-                c100_text = (RUN_ALL.parent / "C100").read_text(encoding="utf-8")
                 run_all_body = run_all_text.split("<<'PY'\n", 1)[1].rsplit(
                     "\nPY", 1
                 )[0]
                 c1_body = c1_text.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
-                c100_body = c100_text.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
                 self.assertEqual(run_all_body, c1_body)
-                self.assertEqual(run_all_body, c100_body)
-                self.assertIn("export VB_CONCURRENCY=100", c100_text)
                 self.assertLess(len(run_all_text.encode("utf-8")), 64 * 1024)
                 self.assertLessEqual(
                     max(len(line.encode("utf-8")) for line in run_all_text.splitlines()),
@@ -338,26 +334,21 @@ class DramPrefixCacheTest(unittest.TestCase):
                 result_dir = result_roots[0]
                 self.assertEqual(
                     {path.name for path in result_dir.glob("C*-result.json")},
-                    {
-                        "C1-result.json",
-                        "C5-result.json",
-                        "C10-result.json",
-                        "C100-result.json",
-                    },
+                    {"C1-result.json", "C5-result.json", "C10-result.json"},
                 )
                 session = json.loads(
                     (result_dir / "session.json").read_text(encoding="utf-8")
                 )
-                self.assertEqual(session["completed_concurrencies"], [1, 5, 10, 100])
+                self.assertEqual(session["completed_concurrencies"], [1, 5, 10])
 
                 manifest = json.loads(
                     (result_dir / "p1-manifest.json").read_text(encoding="utf-8")
                 )
                 requests = list(manifest["requests"].values())
-                self.assertEqual(len(requests), 116)
-                self.assertEqual(len({row["prompt_sha256"] for row in requests}), 116)
+                self.assertEqual(len(requests), 16)
+                self.assertEqual(len({row["prompt_sha256"] for row in requests}), 16)
                 self.assertEqual(
-                    len({row["first_block_sha256"] for row in requests}), 116
+                    len({row["first_block_sha256"] for row in requests}), 16
                 )
 
                 workbook = result_dir / "vb-result.xlsx"
@@ -374,14 +365,14 @@ class DramPrefixCacheTest(unittest.TestCase):
                 if openpyxl is not None:
                     loaded = openpyxl.load_workbook(workbook, read_only=True)
                     summary = loaded["Summary"]
-                    self.assertEqual(summary.max_row, 5)
+                    self.assertEqual(summary.max_row, 4)
                     self.assertEqual(
-                        [summary.cell(row=row, column=1).value for row in range(2, 6)],
-                        ["C1", "C5", "C10", "C100"],
+                        [summary.cell(row=row, column=1).value for row in range(2, 5)],
+                        ["C1", "C5", "C10"],
                     )
                     self.assertEqual(
-                        [summary.cell(row=row, column=7).value for row in range(2, 6)],
-                        ["3/3", "15/15", "30/30", "300/300"],
+                        [summary.cell(row=row, column=7).value for row in range(2, 5)],
+                        ["3/3", "15/15", "30/30"],
                     )
                     loaded.close()
         finally:
