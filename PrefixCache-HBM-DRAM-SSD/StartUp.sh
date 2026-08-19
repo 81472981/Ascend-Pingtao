@@ -92,7 +92,8 @@ cleanup_runtime() {
   if [ -n "$VLLM_PID" ] && kill -0 "$VLLM_PID" 2>/dev/null; then
     kill -TERM "$VLLM_PID" 2>/dev/null
   fi
-  pkill -TERM -f VLLMEngineCore 2>/dev/null
+  # vLLM 版本不同，进程标题可能是 VLLM::EngineCore 或 VLLMEngineCore。
+  pkill -TERM -f 'VLLM::EngineCore|VLLMEngineCore' 2>/dev/null
   if [ -n "$MASTER_PID" ] && kill -0 "$MASTER_PID" 2>/dev/null; then
     kill -TERM "$MASTER_PID" 2>/dev/null
   fi
@@ -102,7 +103,7 @@ cleanup_runtime() {
     cleanup_wait=$((cleanup_wait + 1))
   done
   if [ -n "$VLLM_PID" ]; then kill -KILL "$VLLM_PID" 2>/dev/null; fi
-  pkill -KILL -f VLLMEngineCore 2>/dev/null
+  pkill -KILL -f 'VLLM::EngineCore|VLLMEngineCore' 2>/dev/null
   if [ -n "$MASTER_PID" ]; then kill -KILL "$MASTER_PID" 2>/dev/null; fi
   if [ -n "$VLLM_PID" ]; then wait "$VLLM_PID" 2>/dev/null; fi
   if [ -n "$MASTER_PID" ]; then wait "$MASTER_PID" 2>/dev/null; fi
@@ -183,20 +184,29 @@ fi
 echo "===== [1/5] 清理旧进程 ====="
 # 强杀 vLLM（含子进程 EngineCore）和 mooncake_master
 pkill -9 -f "vllm serve" 2>/dev/null || true
-pkill -9 -f "VLLMEngineCore" 2>/dev/null || true
+pkill -9 -f 'VLLM::EngineCore|VLLMEngineCore' 2>/dev/null || true
 pkill -9 -f mooncake_master 2>/dev/null || true
 # 清理残留 curl（打压脚本可能还在跑）
 pkill -9 -f "curl.*8000" 2>/dev/null || true
 sleep 3
 
 # 确认进程杀干净
-if pgrep -f "vllm serve|mooncake_master" > /dev/null 2>&1; then
+if pgrep -f "vllm serve|VLLM::EngineCore|VLLMEngineCore|mooncake_master" > /dev/null 2>&1; then
   echo "警告：仍有残留进程，再等 3 秒..."
   sleep 3
 fi
-if pgrep -f "vllm serve|mooncake_master" > /dev/null 2>&1; then
+if pgrep -f "vllm serve|VLLM::EngineCore|VLLMEngineCore|mooncake_master" > /dev/null 2>&1; then
   echo "错误：旧 vLLM/Mooncake 进程仍未退出，拒绝删除其 SSD 缓存"
+  pgrep -af "vllm serve|VLLM::EngineCore|VLLMEngineCore|mooncake_master" || true
   exit 1
+fi
+
+# 进程退出后给 NPU runtime 留出释放物理页的时间，并输出启动前占用，便于识别
+# 同容器或同设备上的非本评测进程。
+sleep 5
+if command -v npu-smi >/dev/null 2>&1; then
+  echo "NPU 启动前状态:"
+  npu-smi info || true
 fi
 
 # 确认端口释放
