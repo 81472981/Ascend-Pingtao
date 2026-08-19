@@ -1120,16 +1120,16 @@ def record_result(result, entries):
     local_rate = short_rate(local['rate'] if local else None)
     external_rate = short_rate(external['rate'] if external else None)
     if result['stage'] == 'R1-warmup':
-        evidence = f'理由=L{local_rate},E{external_rate}'
+        evidence = f'理由=本地{local_rate},外部{external_rate}'
     elif result['stage'] == 'R2-hbm-cache':
-        evidence = f'理由=L{local_rate}'
+        evidence = f'理由=本地{local_rate}'
     elif result['stage'] == 'R3-dram-cache':
-        evidence = f'理由=E{external_rate},D{size_text(tier.get("dram_allocated_after"))},R{size_text(tier.get("runtime_read_bytes"))}'
+        evidence = f'理由=外部{external_rate},DRAM{size_text(tier.get("dram_allocated_after"))},读盘{size_text(tier.get("runtime_read_bytes"))}'
     else:
-        evidence = f'理由=E{external_rate},R{size_text(tier.get("runtime_read_bytes"))}/{size_text(tier.get("required_ssd_read_bytes"))},N≥R'
+        evidence = f'理由=外部{external_rate},读盘{size_text(tier.get("runtime_read_bytes"))}/{size_text(tier.get("required_ssd_read_bytes"))},NVMe≥读盘'
     stage = result['stage'].split('-', 1)[0]
     state = 'OK' if result['valid'] else 'X'
-    print(f'  {stage:<2} {result["source"]:<13} | {evidence} | {state}')
+    print(f'  {stage} {result["source"]} | {evidence} | {state}')
 
 def print_terminal_table(payload):
     print('\n+-------+---------------+----------+-------+')
