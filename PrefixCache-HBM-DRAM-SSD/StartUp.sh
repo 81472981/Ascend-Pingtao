@@ -8,6 +8,7 @@ STARTUP_START_TICKS=""
 if [ -r "/proc/$STARTUP_PID/stat" ]; then
   STARTUP_START_TICKS=$(awk '{print $22}' "/proc/$STARTUP_PID/stat")
 fi
+STARTUP_VERSION="restart-preserve-ssd-v1"
 
 SERVED_NAME="Qwen3-8B"
 MODEL_PATH="/mnt/weight/${SERVED_NAME}"
@@ -108,6 +109,107 @@ MASTER_PID=""
 VLLM_PID=""
 VLLM_PATCH_DIR=""
 VLLM_LOG=""
+MASTER_LOG=""
+RUNTIME_GENERATION=1
+RESTART_REQUESTED=0
+RUNTIME_REQUEST_PATH="/tmp/mooncake-benchmark-$STARTUP_PID.request"
+RUNTIME_STATUS_PATH="/tmp/mooncake-benchmark-$STARTUP_PID.status"
+VLLM_START_TIMEOUT_SECONDS="${VLLM_START_TIMEOUT_SECONDS:-1800}"
+
+case "$VLLM_START_TIMEOUT_SECONDS" in
+  ''|*[!0-9]*) echo "错误：VLLM_START_TIMEOUT_SECONDS 必须是整数秒"; exit 1 ;;
+esac
+if [ "$VLLM_START_TIMEOUT_SECONDS" -eq 0 ]; then
+  echo "错误：VLLM_START_TIMEOUT_SECONDS 必须大于 0"
+  exit 1
+fi
+
+umask 077
+: > "$RUNTIME_REQUEST_PATH"
+
+write_runtime_status() {
+  local runtime_state="$1"
+  local runtime_request_id="${2:-}"
+  local runtime_message
+  local runtime_status_tmp="$RUNTIME_STATUS_PATH.tmp"
+  runtime_message=$(printf '%s' "${3:-}" | tr '\n=' '  ')
+  cat > "$runtime_status_tmp" <<EOF
+state=$runtime_state
+generation=$RUNTIME_GENERATION
+request_id=$runtime_request_id
+startup_pid=$STARTUP_PID
+startup_start_ticks=$STARTUP_START_TICKS
+master_pid=$MASTER_PID
+vllm_pid=$VLLM_PID
+ssd_session_path=$SSD_SESSION_PATH
+master_log=$MASTER_LOG
+vllm_log=$VLLM_LOG
+message=$runtime_message
+EOF
+  chmod 600 "$runtime_status_tmp"
+  mv -f "$runtime_status_tmp" "$RUNTIME_STATUS_PATH"
+}
+
+runtime_descendants() {
+  local runtime_parent="$1"
+  local runtime_child
+  for runtime_child in $(pgrep -P "$runtime_parent" 2>/dev/null || true); do
+    runtime_descendants "$runtime_child"
+    printf '%s\n' "$runtime_child"
+  done
+}
+
+process_is_running() {
+  local process_pid="$1"
+  local process_state
+  if ! kill -0 "$process_pid" 2>/dev/null; then
+    return 1
+  fi
+  if [ ! -r "/proc/$process_pid/stat" ]; then
+    return 1
+  fi
+  process_state=$(sed 's/^.*) //' "/proc/$process_pid/stat" 2>/dev/null | awk '{print $1}')
+  [ "$process_state" != "Z" ]
+}
+
+stop_process_tree() {
+  local runtime_root="$1"
+  local runtime_pids runtime_pid runtime_wait runtime_alive
+  if [ -z "$runtime_root" ] || ! process_is_running "$runtime_root"; then
+    if [ -n "$runtime_root" ]; then wait "$runtime_root" 2>/dev/null || true; fi
+    return 0
+  fi
+  runtime_pids="$runtime_root $(runtime_descendants "$runtime_root")"
+  for runtime_pid in $runtime_pids; do
+    kill -TERM "$runtime_pid" 2>/dev/null || true
+  done
+  runtime_wait=0
+  while [ "$runtime_wait" -lt 60 ]; do
+    runtime_alive=false
+    for runtime_pid in $runtime_pids; do
+      if process_is_running "$runtime_pid"; then
+        runtime_alive=true
+        break
+      fi
+    done
+    if [ "$runtime_alive" = false ]; then
+      break
+    fi
+    sleep 1
+    runtime_wait=$((runtime_wait + 1))
+  done
+  for runtime_pid in $runtime_pids; do
+    kill -KILL "$runtime_pid" 2>/dev/null || true
+  done
+  wait "$runtime_root" 2>/dev/null || true
+}
+
+stop_runtime_processes() {
+  stop_process_tree "$VLLM_PID"
+  stop_process_tree "$MASTER_PID"
+  VLLM_PID=""
+  MASTER_PID=""
+}
 
 delete_ssd_session() {
   session_dir="$1"
@@ -123,28 +225,12 @@ delete_ssd_session() {
 
 cleanup_runtime() {
   cleanup_status=$?
-  trap - EXIT INT TERM
+  trap - EXIT INT TERM USR1
   set +e
   echo ""
   echo "正在停止 vLLM/Mooncake 并释放本次 SSD KV Cache..."
-  if [ -n "$VLLM_PID" ] && kill -0 "$VLLM_PID" 2>/dev/null; then
-    kill -TERM "$VLLM_PID" 2>/dev/null
-  fi
-  # vLLM 版本不同，进程标题可能是 VLLM::EngineCore 或 VLLMEngineCore。
-  pkill -TERM -f 'VLLM::EngineCore|VLLMEngineCore' 2>/dev/null
-  if [ -n "$MASTER_PID" ] && kill -0 "$MASTER_PID" 2>/dev/null; then
-    kill -TERM "$MASTER_PID" 2>/dev/null
-  fi
-  cleanup_wait=0
-  while [ "$cleanup_wait" -lt 30 ] && { { [ -n "$VLLM_PID" ] && kill -0 "$VLLM_PID" 2>/dev/null; } || { [ -n "$MASTER_PID" ] && kill -0 "$MASTER_PID" 2>/dev/null; }; }; do
-    sleep 1
-    cleanup_wait=$((cleanup_wait + 1))
-  done
-  if [ -n "$VLLM_PID" ]; then kill -KILL "$VLLM_PID" 2>/dev/null; fi
-  pkill -KILL -f 'VLLM::EngineCore|VLLMEngineCore' 2>/dev/null
-  if [ -n "$MASTER_PID" ]; then kill -KILL "$MASTER_PID" 2>/dev/null; fi
-  if [ -n "$VLLM_PID" ]; then wait "$VLLM_PID" 2>/dev/null; fi
-  if [ -n "$MASTER_PID" ]; then wait "$MASTER_PID" 2>/dev/null; fi
+  write_runtime_status stopping "" "final cleanup" 2>/dev/null || true
+  stop_runtime_processes
   if [ -n "$VLLM_LOG" ] && [ -f "$VLLM_LOG" ]; then
     echo "vLLM 日志保留：$VLLM_LOG"
   fi
@@ -164,9 +250,11 @@ cleanup_runtime() {
     echo "错误：SSD KV Cache 自动清理失败，请确认没有残留进程或子挂载：$SSD_SESSION_PATH"
     if [ "$cleanup_status" -eq 0 ]; then cleanup_status=1; fi
   fi
+  rm -f "$RUNTIME_REQUEST_PATH" "$RUNTIME_STATUS_PATH" "$RUNTIME_STATUS_PATH.tmp"
   exit "$cleanup_status"
 }
 trap cleanup_runtime EXIT INT TERM
+trap 'RESTART_REQUESTED=1' USR1
 
 if ! command -v findmnt >/dev/null 2>&1 || ! command -v lsblk >/dev/null 2>&1; then
   echo "错误：需要 findmnt 和 lsblk 来证明 SSD 路径位于非旋转块设备上"
@@ -237,7 +325,7 @@ echo "===== [1/5] 清理旧进程 ====="
 pkill -9 -f "vllm serve" 2>/dev/null || true
 pkill -9 -f 'VLLM::EngineCore|VLLMEngineCore' 2>/dev/null || true
 pkill -9 -f mooncake_master 2>/dev/null || true
-# 清理残留 curl（打压脚本可能还在跑）
+# 清理可能残留的旧测试 curl
 pkill -9 -f "curl.*8000" 2>/dev/null || true
 sleep 3
 
@@ -318,6 +406,7 @@ fi
 
 echo ""
 echo "===== [2/5] 环境变量 ====="
+echo "启动脚本版本：$STARTUP_VERSION"
 PYTHON_REAL_BIN=$(readlink -f "$(command -v python3)")
 PYTHON_BIN_DIR=$(dirname "$PYTHON_REAL_BIN")
 MOONCAKE_PYTHON_SITE=$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
@@ -540,62 +629,156 @@ cat > $MOONCAKE_JSON <<EOF
   "benchmark_ssd_io_mode": "posix-fadvise-dontneed",
   "benchmark_ssd_overlay_verified": $SSD_OVERLAY_MODE,
   "benchmark_cleanup_managed": true,
+  "benchmark_startup_version": "$STARTUP_VERSION",
   "benchmark_startup_pid": $STARTUP_PID,
-  "benchmark_startup_start_ticks": "$STARTUP_START_TICKS"
+  "benchmark_startup_start_ticks": "$STARTUP_START_TICKS",
+  "benchmark_runtime_control": "signal-request-v1",
+  "benchmark_runtime_request_path": "$RUNTIME_REQUEST_PATH",
+  "benchmark_runtime_status_path": "$RUNTIME_STATUS_PATH"
 }
 EOF
 cat $MOONCAKE_JSON
 
-echo ""
-echo "===== [4/5] 启动 mooncake_master ====="
-"$MOONCAKE_MASTER_BIN" --port $MASTER_PORT \
-  --eviction_high_watermark_ratio 0.9 \
-  --eviction_ratio 0.1 \
-  --default_kv_lease_ttl 11000 \
-  --enable_offload=true \
-  --offload_on_evict=false \
-  --promotion_on_hit=false \
-  --enable_metric_reporting=true \
-  --client_ttl=120 \
-  > /tmp/mooncake_master.log 2>&1 &
-MASTER_PID=$!
-sleep 3
+wait_master_ready() {
+  master_wait=0
+  while [ "$master_wait" -lt 60 ]; do
+    if ! kill -0 "$MASTER_PID" 2>/dev/null; then
+      echo "错误：mooncake_master 启动失败，查看日志：$MASTER_LOG"
+      tail -20 "$MASTER_LOG" || true
+      return 1
+    fi
+    if curl -s -m 2 "http://127.0.0.1:$METRICS_PORT/health" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    master_wait=$((master_wait + 1))
+  done
+  echo "错误：mooncake_master 60 秒内未就绪，查看日志：$MASTER_LOG"
+  tail -20 "$MASTER_LOG" || true
+  return 1
+}
 
-# 验证 mooncake_master 启动成功且数据为空
-if curl -s -m 2 http://127.0.0.1:$METRICS_PORT/health > /dev/null 2>&1; then
-  echo "mooncake_master 启动成功"
-  echo "初始状态: $(curl -s http://127.0.0.1:$METRICS_PORT/metrics/summary | grep -o 'Mem Storage: [^|]*| SSD Storage: [^|]*| Keys: [0-9]*' | head -1)"
-  echo "可靠性校验: R4 前刷盘并清 SSD 文件页缓存 + Mooncake DRAM/SSD 分配量 + 评测进程树物理读盘 + NVMe 块设备读盘"
-else
-  echo "错误：mooncake_master 启动失败，查看日志："
-  tail -20 /tmp/mooncake_master.log
-  exit 1
-fi
+wait_vllm_ready() {
+  vllm_wait=0
+  while [ "$vllm_wait" -lt "$VLLM_START_TIMEOUT_SECONDS" ]; do
+    if ! kill -0 "$VLLM_PID" 2>/dev/null; then
+      echo "错误：vLLM 启动失败，查看日志：$VLLM_LOG"
+      tail -40 "$VLLM_LOG" || true
+      return 1
+    fi
+    if curl -s -f -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    vllm_wait=$((vllm_wait + 1))
+  done
+  echo "错误：vLLM ${VLLM_START_TIMEOUT_SECONDS} 秒内未就绪，查看日志：$VLLM_LOG"
+  tail -40 "$VLLM_LOG" || true
+  return 1
+}
 
-echo ""
-echo "===== [5/5] 启动 vLLM ====="
-echo "配置: SSD staging buffer=${SSD_BUFFER_MB}MB；SSD I/O=POSIX（禁用不兼容的io_uring）；Ascend中转池=$ASCEND_BUFFER_POOL；SSD初始化顺序=NPU-KV之后；max-model-len=$VLLM_MAX_MODEL_LEN；gpu-memory-utilization=$VLLM_GPU_MEMORY_UTILIZATION"
-VLLM_LOG="/tmp/vllm-ssd-$STARTUP_PID.log"
-echo "vLLM 日志: $VLLM_LOG"
-vllm serve "$MODEL_PATH" \
-  --port "$PORT" \
-  --trust-remote-code \
-  --served-model-name "$SERVED_NAME" \
-  --block-size 128 \
-  --enable-prefix-caching \
-  --tensor-parallel-size 1 \
-  --max-model-len "$VLLM_MAX_MODEL_LEN" \
-  --gpu-memory-utilization "$VLLM_GPU_MEMORY_UTILIZATION" \
-  --kv-transfer-config '{
-    "kv_connector": "AscendStoreConnector",
-    "kv_role": "kv_both",
-    "kv_load_failure_policy": "recompute",
-    "kv_connector_extra_config": {
-      "backend": "mooncake",
-      "lookup_rpc_port": "0",
-      "load_async": false
-    }
-  }' > >(tee "$VLLM_LOG") 2>&1 &
-VLLM_PID=$!
-wait "$VLLM_PID"
+start_runtime() {
+  MASTER_LOG="/tmp/mooncake-master-$STARTUP_PID-g$RUNTIME_GENERATION.log"
+  VLLM_LOG="/tmp/vllm-ssd-$STARTUP_PID-g$RUNTIME_GENERATION.log"
+  write_runtime_status starting "${1:-}" "starting generation $RUNTIME_GENERATION"
+
+  echo ""
+  echo "===== [4/5] 启动 mooncake_master（第${RUNTIME_GENERATION}代）====="
+  "$MOONCAKE_MASTER_BIN" --port "$MASTER_PORT" \
+    --eviction_high_watermark_ratio 0.9 \
+    --eviction_ratio 0.1 \
+    --default_kv_lease_ttl 11000 \
+    --enable_offload=true \
+    --offload_on_evict=false \
+    --promotion_on_hit=false \
+    --enable_metric_reporting=true \
+    --client_ttl=120 \
+    > "$MASTER_LOG" 2>&1 &
+  MASTER_PID=$!
+  wait_master_ready
+  echo "mooncake_master 已就绪"
+
+  echo ""
+  echo "===== [5/5] 启动 vLLM（第${RUNTIME_GENERATION}代）====="
+  echo "配置: SSD staging buffer=${SSD_BUFFER_MB}MB；SSD I/O=POSIX；Ascend中转池=$ASCEND_BUFFER_POOL；max-model-len=$VLLM_MAX_MODEL_LEN"
+  echo "vLLM 日志: $VLLM_LOG"
+  vllm serve "$MODEL_PATH" \
+    --port "$PORT" \
+    --trust-remote-code \
+    --served-model-name "$SERVED_NAME" \
+    --block-size 128 \
+    --enable-prefix-caching \
+    --tensor-parallel-size 1 \
+    --max-model-len "$VLLM_MAX_MODEL_LEN" \
+    --gpu-memory-utilization "$VLLM_GPU_MEMORY_UTILIZATION" \
+    --kv-transfer-config '{
+      "kv_connector": "AscendStoreConnector",
+      "kv_role": "kv_both",
+      "kv_load_failure_policy": "recompute",
+      "kv_connector_extra_config": {
+        "backend": "mooncake",
+        "lookup_rpc_port": "0",
+        "load_async": false
+      }
+    }' > >(tee "$VLLM_LOG") 2>&1 &
+  VLLM_PID=$!
+  wait_vllm_ready
+  write_runtime_status ready "${1:-}" "generation $RUNTIME_GENERATION ready"
+  echo "运行时已就绪：第${RUNTIME_GENERATION}代；SSD目录保持为 $SSD_SESSION_PATH"
+}
+
+read_request_value() {
+  local request_key="$1"
+  awk -F= -v key="$request_key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$RUNTIME_REQUEST_PATH"
+}
+
+handle_restart_request() {
+  local restart_command restart_expected_generation restart_request_id
+  RESTART_REQUESTED=0
+  if [ ! -f "$RUNTIME_REQUEST_PATH" ] || [ -L "$RUNTIME_REQUEST_PATH" ]; then
+    write_runtime_status failed "" "invalid restart request file"
+    return 0
+  fi
+  restart_command=$(read_request_value command)
+  restart_expected_generation=$(read_request_value expected_generation)
+  restart_request_id=$(read_request_value request_id)
+  case "$restart_request_id" in
+    ''|*[!A-Za-z0-9._-]*)
+      write_runtime_status failed "" "invalid request id"
+      return 0
+      ;;
+  esac
+  if [ "$restart_command" != "restart" ] || [ "$restart_expected_generation" != "$RUNTIME_GENERATION" ]; then
+    write_runtime_status failed "$restart_request_id" "restart request generation mismatch"
+    return 0
+  fi
+
+  echo ""
+  echo "收到 SSD 保留重启请求：第${RUNTIME_GENERATION}代 -> 第$((RUNTIME_GENERATION + 1))代"
+  write_runtime_status restarting "$restart_request_id" "preserving SSD; clearing HBM and DRAM"
+  stop_runtime_processes
+  sleep 5
+  RUNTIME_GENERATION=$((RUNTIME_GENERATION + 1))
+  start_runtime "$restart_request_id"
+}
+
+start_runtime "initial"
+echo "初始状态: $(curl -s "http://127.0.0.1:$METRICS_PORT/metrics/summary" | grep -o 'Mem Storage: [^|]*| SSD Storage: [^|]*| Keys: [0-9]*' | head -1)"
+echo "可靠性校验: 重启清空HBM/DRAM且保留SSD；R4校验外部命中、进程读盘和NVMe读盘"
+echo "启动窗口请保持打开；Run-all 会自动请求受控重启，无需手工操作。"
+
+while true; do
+  if [ "$RESTART_REQUESTED" -eq 1 ]; then
+    handle_restart_request
+  fi
+  if [ -z "$MASTER_PID" ] || ! kill -0 "$MASTER_PID" 2>/dev/null; then
+    echo "错误：mooncake_master 意外退出：$MASTER_LOG"
+    exit 1
+  fi
+  if [ -z "$VLLM_PID" ] || ! kill -0 "$VLLM_PID" 2>/dev/null; then
+    echo "错误：vLLM 意外退出：$VLLM_LOG"
+    exit 1
+  fi
+  sleep 1 || true
+done
 )
