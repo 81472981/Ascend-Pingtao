@@ -19,6 +19,10 @@ from xml.etree import ElementTree
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "PrefixCache-HBM-DRAM-SSD" / "C5"
 RUN_ALL = REPO_ROOT / "PrefixCache-HBM-DRAM-SSD" / "Run-all"
+RUN_ALL_PAYLOAD = REPO_ROOT / "PrefixCache-HBM-DRAM-SSD" / "Run-all.payload"
+RUN_ALL_BUILDER = (
+    REPO_ROOT / "PrefixCache-HBM-DRAM-SSD" / "tools" / "build_run_all_wrapper.py"
+)
 FAKE_VLLM = REPO_ROOT / "tests" / "fake_vllm.py"
 
 FAKE_RUNTIME_MANAGER = r'''
@@ -221,7 +225,8 @@ class DramHandler(http.server.BaseHTTPRequestHandler):
                 if "-r1-" in request_id:
                     self.state.keys += 1
                     self.state.dram_allocated_bytes += 8192
-                    self.state.ssd_allocated_bytes += 8192
+                    # Production persists 126 of 128 DRAM-accounted blocks.
+                    self.state.ssd_allocated_bytes += 8192 * 126 // 128
                 elif "-r2-" in request_id:
                     self.state.local_hits += cacheable_tokens
                     self.state.external_hits += cacheable_tokens
@@ -257,6 +262,23 @@ class DramHandler(http.server.BaseHTTPRequestHandler):
 
 
 class DramPrefixCacheTest(unittest.TestCase):
+    def test_run_all_wrapper_is_current_and_paste_sized(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, str(RUN_ALL_BUILDER), "--check"],
+            text=True,
+            capture_output=True,
+            check=False,
+            cwd=REPO_ROOT,
+        )
+        self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+        run_all_text = RUN_ALL.read_text(encoding="utf-8")
+        self.assertLess(len(run_all_text.encode("utf-8")), 32 * 1024)
+        self.assertLessEqual(
+            max(len(line.encode("utf-8")) for line in run_all_text.splitlines()),
+            128,
+        )
+        self.assertGreater(len(RUN_ALL_PAYLOAD.read_bytes()), len(run_all_text.encode()))
+
     def test_c5_interleaves_stages_and_writes_one_workbook(self) -> None:
         state = FakeState()
         DramHandler.state = state
@@ -475,7 +497,7 @@ class DramPrefixCacheTest(unittest.TestCase):
                     }
                 )
                 run_all_text = RUN_ALL.read_text(encoding="utf-8")
-                self.assertLess(len(run_all_text.encode("utf-8")), 64 * 1024)
+                self.assertLess(len(run_all_text.encode("utf-8")), 32 * 1024)
                 self.assertLessEqual(
                     max(len(line.encode("utf-8")) for line in run_all_text.splitlines()),
                     1024,
@@ -497,6 +519,9 @@ class DramPrefixCacheTest(unittest.TestCase):
                     0,
                     msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
                 )
+                self.assertIn("SSD副本 | 实际", completed.stdout)
+                self.assertIn("最低", completed.stdout)
+                self.assertNotIn("not stable", completed.stderr)
 
                 result_roots = list((root / "vb-result").iterdir())
                 self.assertEqual(len(result_roots), 1)
@@ -521,6 +546,8 @@ class DramPrefixCacheTest(unittest.TestCase):
                 )
                 self.assertEqual(session["completed_concurrencies"], [1, 5, 10, 100])
                 self.assertEqual(session["storage_tiers"], ["HBM", "DRAM", "SSD"])
+                self.assertEqual(session["ssd_replica_blocks"], 126)
+                self.assertEqual(session["ssd_replica_rate"], 126 / 128)
                 self.assertEqual(session["ssd_transition"]["mode"], "signal-request-v1")
                 runtime_status = dict(
                     line.split("=", 1)
@@ -649,17 +676,16 @@ class DramPrefixCacheTest(unittest.TestCase):
                         "VB_RUN_DIR": str(root / "results"),
                         "VB_BATCHES": "1",
                         "VB_EXPECT_CONCURRENCIES": "1",
+                        "VB_RUN_CONCURRENCIES": "1",
                         "VB_STORE_STABLE_SECONDS": "0",
                         "VB_STORE_TIMEOUT_SECONDS": "5",
                         "VB_RUNTIME_RESTART_TIMEOUT_SECONDS": "30",
                     }
                 )
                 run_all_text = RUN_ALL.read_text(encoding="utf-8")
-                single_c1 = run_all_text.rsplit("\nrun_concurrency 1 1", 1)[0]
-                single_c1 += "\nrun_concurrency 1 1\n"
                 completed = subprocess.run(
                     ["bash", "-s"],
-                    input=single_c1,
+                    input=run_all_text,
                     text=True,
                     capture_output=True,
                     check=False,

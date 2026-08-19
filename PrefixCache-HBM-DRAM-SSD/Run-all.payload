@@ -1,0 +1,1323 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -z "${VB_RUN_DIR:-}" ]]; then
+  result_root="vb-result"
+  result_stamp="$("${PYTHON:-python3}" -c 'from datetime import datetime, timedelta, timezone; print(datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H-%M-%S"))')"
+  VB_RUN_DIR="$result_root/$result_stamp"
+  result_suffix=2
+  while [[ -e "$VB_RUN_DIR" ]]; do
+    printf -v suffix_text '%02d' "$result_suffix"
+    VB_RUN_DIR="$result_root/$result_stamp-$suffix_text"
+    ((result_suffix += 1))
+  done
+fi
+export VB_RUN_DIR
+export VB_EXPECT_CONCURRENCIES="${VB_EXPECT_CONCURRENCIES:-1,5,10,100}"
+
+cleanup_started_runtime() {
+  run_status=$?
+  trap - EXIT INT TERM
+  set +e
+  cleanup_status=0
+  case "${VB_CLEANUP_AFTER_RUN:-1}" in
+    0|false|FALSE|no|NO) ;;
+    *)
+      "${PYTHON:-python3}" - "${MOONCAKE_CONFIG_PATH:-/tmp/mooncake.json}" <<'PY'
+import json
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+if not config_path.is_file():
+    print(f'Cleanup skipped: Mooncake config not found: {config_path}')
+    raise SystemExit(0)
+config = json.loads(config_path.read_text(encoding='utf-8'))
+if not config.get('benchmark_cleanup_managed'):
+    print('Cleanup skipped: StartUp.sh does not manage this runtime')
+    raise SystemExit(0)
+pid = int(config.get('benchmark_startup_pid') or 0)
+expected_start_ticks = str(config.get('benchmark_startup_start_ticks') or '')
+ssd_path = Path(config.get('ssd_offload_path') or '')
+if pid <= 1 or not ssd_path.is_absolute() or not ssd_path.name.startswith('session-'):
+    raise SystemExit(f'Refusing unsafe cleanup request: pid={pid}, ssd_path={ssd_path}')
+try:
+    stat_text = Path(f'/proc/{pid}/stat').read_text(encoding='ascii')
+except OSError as error:
+    if not ssd_path.exists():
+        print(f'SSD KV Cache already released: {ssd_path}')
+        raise SystemExit(0)
+    raise SystemExit(f'Cannot verify StartUp.sh process {pid}: {error}')
+stat_tail = stat_text[stat_text.rfind(')') + 2:].split()
+current_start_ticks = stat_tail[19] if len(stat_tail) > 19 else ''
+if expected_start_ticks:
+    if current_start_ticks != expected_start_ticks:
+        raise SystemExit(f'Refusing reused PID {pid}: process start time changed')
+else:
+    cmdline = Path(f'/proc/{pid}/cmdline').read_bytes().replace(b'\0', b' ')
+    if b'StartUp.sh' not in cmdline:
+        raise SystemExit(f'Refusing to signal PID {pid}; it is not StartUp.sh: {cmdline!r}')
+print(f'Stopping benchmark runtime; StartUp.sh will release SSD KV Cache: {ssd_path}')
+os.kill(pid, signal.SIGTERM)
+deadline = time.monotonic() + 120
+while time.monotonic() < deadline:
+    process_exists = Path(f'/proc/{pid}').exists()
+    if not process_exists and not ssd_path.exists():
+        print(f'SSD KV Cache released: {ssd_path}')
+        raise SystemExit(0)
+    time.sleep(1)
+raise SystemExit(f'Cleanup timed out; check process {pid} and path {ssd_path}')
+PY
+      cleanup_status=$?
+      ;;
+  esac
+  if [ "$run_status" -eq 0 ] && [ "$cleanup_status" -ne 0 ]; then
+    run_status=$cleanup_status
+  fi
+  exit "$run_status"
+}
+trap cleanup_started_runtime EXIT INT TERM
+
+echo "Results from all stages will be written to: $VB_RUN_DIR"
+echo "Self-contained execution: C1 -> C5 -> C10 -> C100"
+echo "每组流程：R1冷读 -> R2 HBM -> R3 DRAM -> 自动保留SSD重启 -> R4 SSD"
+
+run_concurrency() {
+  VB_CONCURRENCY="$1" VB_NEW_SESSION="$2" "${PYTHON:-python3}" - <<'PY'
+import hashlib
+import http.client
+import http.server
+import fcntl
+import json
+import math
+import os
+import re
+import signal
+import shlex
+import shutil
+import stat
+import statistics
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+import zipfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from xml.sax.saxutils import escape
+HOST = os.environ.get('VB_HOST', '127.0.0.1')
+PORT = int(os.environ.get('VB_PORT', '8000'))
+CONCURRENCY = int(os.environ['VB_CONCURRENCY'])
+INPUT_LEN = int(os.environ.get('VB_INPUT_LEN', str(16 * 1024)))
+BLOCK_SIZE = int(os.environ.get('VB_BLOCK_SIZE', '128'))
+BATCHES = int(os.environ.get('VB_BATCHES', '5'))
+BASE_SEED = int(os.environ.get('VB_BASE_SEED', '314159'))
+MIN_HIT_RATE = float(os.environ.get('VB_MIN_HIT_RATE', '0.95'))
+MAX_MISS_RATE = float(os.environ.get('VB_MAX_MISS_RATE', '0.05'))
+STORE_STABLE_SECONDS = float(os.environ.get('VB_STORE_STABLE_SECONDS', '2'))
+STORE_TIMEOUT_SECONDS = float(os.environ.get('VB_STORE_TIMEOUT_SECONDS', '300'))
+RUNTIME_RESTART_TIMEOUT_SECONDS = float(os.environ.get('VB_RUNTIME_RESTART_TIMEOUT_SECONDS', '1800'))
+STRICT = os.environ.get('VB_STRICT', '1').lower() not in ('0', 'false', 'no')
+NEW_SESSION = os.environ.get('VB_NEW_SESSION', '0').lower() in ('1', 'true', 'yes')
+EXPECTED_CONCURRENCIES = [int(value) for value in os.environ.get('VB_EXPECT_CONCURRENCIES', '1,5,10,100').split(',') if value.strip()]
+VLLM_BIN = os.environ.get('VLLM_BIN', 'vllm')
+MODEL = os.environ.get('VB_MODEL') or None
+SERVED_MODEL_NAME = os.environ.get('VB_SERVED_MODEL_NAME') or None
+TOKENIZER = os.environ.get('VB_TOKENIZER') or None
+def default_run_dir():
+    root = Path('vb-result')
+    stamp = datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H-%M-%S')
+    candidate = root / stamp
+    suffix = 2
+    while candidate.exists():
+        candidate = root / f'{stamp}-{suffix:02d}'
+        suffix += 1
+    return candidate
+RUN_DIR = Path(os.environ.get('VB_RUN_DIR') or default_run_dir())
+JSON_DIR = RUN_DIR / 'json' / f'C{CONCURRENCY}'
+RESULT_PATH = RUN_DIR / f'C{CONCURRENCY}-result.json'
+SESSION_PATH = RUN_DIR / 'session.json'
+MANIFEST_PATH = RUN_DIR / 'p1-manifest.json'
+PROMPTS_PATH = RUN_DIR / 'p1-prompts.jsonl'
+WORKBOOK_PATH = RUN_DIR / 'vb-result.xlsx'
+MOONCAKE_URL = os.environ.get('VB_MOONCAKE_METRICS_URL', 'http://127.0.0.1:9003/metrics/summary')
+MOONCAKE_PROMETHEUS_URL = os.environ.get('VB_MOONCAKE_PROMETHEUS_URL') or MOONCAKE_URL.removesuffix('/summary')
+MOONCAKE_CONFIG = Path(os.environ.get('MOONCAKE_CONFIG_PATH', '/tmp/mooncake.json'))
+SSD_BLOCK_STAT = None
+SSD_OFFLOAD_PATH = None
+ROOT_PID = None
+START_TICKS = None
+REQUEST_PATH = None
+STATUS_PATH = None
+RUNTIME_READ_BYTES_OVERRIDE = Path(os.environ['VB_RUNTIME_READ_BYTES_PATH']) if os.environ.get('VB_RUNTIME_READ_BYTES_PATH') else None
+STAGES = ('R1-warmup', 'R2-hbm-cache', 'R3-dram-cache', 'R4-ssd-cache')
+if CONCURRENCY <= 0 or BATCHES <= 0:
+    sys.exit('VB_CONCURRENCY and VB_BATCHES must be positive integers')
+if INPUT_LEN <= 0 or BLOCK_SIZE <= 0 or INPUT_LEN % BLOCK_SIZE:
+    sys.exit('VB_INPUT_LEN must be positive and divisible by VB_BLOCK_SIZE')
+if RUNTIME_RESTART_TIMEOUT_SECONDS <= 0:
+    sys.exit('VB_RUNTIME_RESTART_TIMEOUT_SECONDS must be positive')
+REQUIRED_SOURCE_HIT_RATE = max(MIN_HIT_RATE, (INPUT_LEN - BLOCK_SIZE) / INPUT_LEN - 1e-9)
+# The connector's leading boundary and the trailing compute boundary are
+# included in DRAM accounting but do not form reusable file-backend payload.
+# Keep the SSD completeness ratio independent from the token hit-rate ratio.
+SSD_REPLICA_BLOCKS = max(0, INPUT_LEN // BLOCK_SIZE - 2)
+SSD_REPLICA_RATE = SSD_REPLICA_BLOCKS * BLOCK_SIZE / INPUT_LEN
+if SSD_REPLICA_BLOCKS <= 0:
+    sys.exit('VB_INPUT_LEN must contain more than two cache blocks for SSD validation')
+CACHE_PAIRS = {'local': (('vllm:prefix_cache_queries_total', 'vllm:prefix_cache_hits_total'), ('vllm:prefix_cache_queries', 'vllm:prefix_cache_hits')), 'external': (('vllm:external_prefix_cache_queries_total', 'vllm:external_prefix_cache_hits_total'), ('vllm:external_prefix_cache_queries', 'vllm:external_prefix_cache_hits'))}
+TIER_METRIC_NAMES = {
+    'dram_allocated_bytes': ('master_allocated_bytes',),
+    'ssd_allocated_bytes': ('master_allocated_file_size_bytes',),
+}
+CAPTURE_LOCK = threading.Lock()
+CAPTURE_RECORDS = []
+CAPTURE_PREFIX = ''
+BENCH_HOST = HOST
+BENCH_PORT = PORT
+
+def now_cn():
+    return datetime.now(timezone(timedelta(hours=8))).isoformat()
+
+def fetch(url, timeout=10):
+    return urllib.request.urlopen(url, timeout=timeout).read().decode('utf-8', 'replace')
+
+def post_json(url, payload, timeout=120):
+    request = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode('utf-8'), headers={'Content-Type': 'application/json; charset=utf-8'}, method='POST')
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return (response.status, json.loads(response.read().decode('utf-8')))
+
+def model_info():
+    try:
+        data = json.loads(fetch(f'http://{HOST}:{PORT}/v1/models'))
+        item = (data.get('data') or [])[0]
+        return (item.get('id'), item.get('root'))
+    except Exception:
+        return (None, None)
+
+def discover_model():
+    global MODEL, SERVED_MODEL_NAME, TOKENIZER
+    served, root = model_info()
+    MODEL = MODEL or root or served
+    SERVED_MODEL_NAME = SERVED_MODEL_NAME or served or MODEL
+    if TOKENIZER is None and MODEL and Path(MODEL).expanduser().is_dir():
+        TOKENIZER = str(Path(MODEL).expanduser())
+    if not MODEL:
+        sys.exit('cannot discover model; set VB_MODEL and VB_SERVED_MODEL_NAME')
+
+def vllm_command():
+    parts = shlex.split(VLLM_BIN)
+    executable = parts[0]
+    if not os.path.dirname(executable) and shutil.which(executable) is None:
+        candidate = Path('.venv/bin') / executable
+        if candidate.is_file():
+            parts[0] = str(candidate.resolve())
+        else:
+            sys.exit(f'vllm not found: {executable}')
+    elif os.path.dirname(executable) and (not Path(executable).is_file()):
+        sys.exit(f'vllm not found: {executable}')
+    return parts
+
+def metric_sum(text, name):
+    values = []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0].split('{', 1)[0] == name:
+            try:
+                values.append(float(fields[1]))
+            except ValueError:
+                pass
+    return sum(values) if values else None
+
+def first_metric(text, names):
+    for name in names:
+        value = metric_sum(text, name)
+        if value is not None:
+            return value
+    return None
+
+def tier_metrics():
+    try:
+        text = fetch(MOONCAKE_PROMETHEUS_URL)
+    except Exception:
+        return {name: None for name in TIER_METRIC_NAMES}
+    return {name: first_metric(text, candidates) for name, candidates in TIER_METRIC_NAMES.items()}
+
+def tier_delta(before, after):
+    return {
+        name: (after[name] - before[name]) if before.get(name) is not None and after.get(name) is not None else None
+        for name in TIER_METRIC_NAMES
+    }
+
+def ssd_device_read_bytes():
+    if SSD_BLOCK_STAT is None:
+        return None
+    try:
+        fields = SSD_BLOCK_STAT.read_text(encoding='ascii').split()
+        return int(fields[2]) * 512
+    except (OSError, IndexError, ValueError):
+        return None
+
+def runtime_read_bytes():
+    if RUNTIME_READ_BYTES_OVERRIDE is not None:
+        try:
+            return int(RUNTIME_READ_BYTES_OVERRIDE.read_text(encoding='ascii').strip())
+        except (OSError, ValueError):
+            return None
+    if ROOT_PID is None or not Path(f'/proc/{ROOT_PID}').exists():
+        return None
+    parents = {}
+    for stat_path in Path('/proc').glob('[0-9]*/stat'):
+        try:
+            text = stat_path.read_text(encoding='ascii')
+            tail = text[text.rfind(')') + 2:].split()
+            parents[int(stat_path.parent.name)] = int(tail[1])
+        except (OSError, IndexError, ValueError):
+            continue
+    runtime_pids = {ROOT_PID}
+    changed = True
+    while changed:
+        changed = False
+        for pid, parent in parents.items():
+            if parent in runtime_pids and pid not in runtime_pids:
+                runtime_pids.add(pid)
+                changed = True
+    total = 0
+    readable = 0
+    for pid in runtime_pids:
+        try:
+            for line in Path(f'/proc/{pid}/io').read_text(encoding='ascii').splitlines():
+                if line.startswith('read_bytes:'):
+                    total += int(line.split(':', 1)[1])
+                    readable += 1
+                    break
+        except (OSError, ValueError):
+            continue
+    return total if readable else None
+
+def process_start_ticks(pid):
+    try:
+        text = Path(f'/proc/{pid}/stat').read_text(encoding='ascii')
+    except OSError:
+        return os.environ.get('VB_RUNTIME_START_TICKS_OVERRIDE') if sys.platform != 'linux' else None
+    tail = text[text.rfind(')') + 2:].split()
+    return tail[19] if len(tail) > 19 else None
+
+def validate_runtime_identity():
+    current = process_start_ticks(ROOT_PID)
+    if current != START_TICKS:
+        raise RuntimeError(f'startup manager changed: PID={ROOT_PID}, start={current}')
+
+def require_regular(path, label):
+    try:
+        mode = path.lstat().st_mode
+    except OSError as error:
+        raise RuntimeError(f'cannot access {label}: {error}') from error
+    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+        raise RuntimeError(f'unsafe {label}: {path}')
+
+def read_runtime_status():
+    require_regular(STATUS_PATH, 'runtime status')
+    pairs = [line.split('=', 1) for line in STATUS_PATH.read_text(encoding='utf-8').splitlines() if '=' in line]
+    values = dict(pairs)
+    if len(values) != len(pairs):
+        raise RuntimeError('duplicate runtime status key')
+    try:
+        values['generation'] = int(values.get('generation', '0'))
+        status_pid = int(values.get('startup_pid', '0'))
+    except ValueError as error:
+        raise RuntimeError(f'invalid runtime status: {values}') from error
+    if status_pid != ROOT_PID or values.get('startup_start_ticks') != START_TICKS:
+        raise RuntimeError('runtime status identity mismatch')
+    if values.get('ssd_session_path') != str(SSD_OFFLOAD_PATH):
+        raise RuntimeError('runtime status SSD path changed')
+    if values['generation'] <= 0:
+        raise RuntimeError(f'invalid runtime generation: {values["generation"]}')
+    return values
+
+def write_restart_request(generation, request_id):
+    require_regular(REQUEST_PATH, 'runtime request')
+    temporary = Path(f'{REQUEST_PATH}.tmp-{os.getpid()}')
+    payload = f'command=restart\nexpected_generation={generation}\nrequest_id={request_id}\n'.encode('ascii')
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+        with os.fdopen(os.open(temporary, flags, 0o600), 'wb') as request_file:
+            request_file.write(payload)
+            request_file.flush()
+            os.fsync(request_file.fileno())
+        os.replace(temporary, REQUEST_PATH)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+def request_runtime_restart():
+    validate_runtime_identity()
+    status = read_runtime_status()
+    if status.get('state') != 'ready':
+        raise RuntimeError(f'runtime not ready: {status}')
+    before = tier_metrics()
+    old_dram = before.get('dram_allocated_bytes')
+    old_ssd = before.get('ssd_allocated_bytes')
+    old_keys = mooncake_keys()
+    if old_dram is None or old_dram <= 0:
+        raise RuntimeError(f'no DRAM before restart: {old_dram}')
+    if old_ssd is None or old_ssd <= 0 or old_keys is None or old_keys <= 0:
+        raise RuntimeError(f'no SSD data before restart: SSD={old_ssd}, Keys={old_keys}')
+
+    gen = status['generation']
+    next_gen = gen + 1
+    req = f'{os.getpid()}-{time.time_ns()}'
+    write_restart_request(gen, req)
+    os.kill(ROOT_PID, signal.SIGUSR1)
+
+    deadline = time.monotonic() + RUNTIME_RESTART_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        validate_runtime_identity()
+        current = read_runtime_status()
+        if current.get('state') == 'failed' and current.get('request_id') == req:
+            raise RuntimeError(f'restart rejected: {current.get("message", "")}')
+        if current.get('state') == 'ready' and current.get('request_id') == req and current['generation'] == next_gen:
+            break
+        time.sleep(0.5)
+    else:
+        raise RuntimeError('runtime restart timed out')
+
+    deadline = time.monotonic() + STORE_TIMEOUT_SECONDS
+    stable = None
+    last = None
+    while time.monotonic() < deadline:
+        validate_runtime_identity()
+        status = read_runtime_status()
+        if status.get('state') != 'ready' or status['generation'] != next_gen:
+            raise RuntimeError(f'runtime left ready state: {status}')
+        tier = tier_metrics()
+        keys = mooncake_keys()
+        dram = tier.get('dram_allocated_bytes')
+        ssd = tier.get('ssd_allocated_bytes')
+        cache = cache_metrics()
+        recovered = (
+            ssd is not None and ssd >= old_ssd
+            and keys is not None and keys >= old_keys
+            and dram in (None, 0)
+            and cache.get('local') is not None and cache.get('external') is not None
+            and runtime_read_bytes() is not None
+        )
+        snapshot = (dram, ssd, keys)
+        if recovered and snapshot == last:
+            stable = stable or time.monotonic()
+            if time.monotonic() - stable >= STORE_STABLE_SECONDS:
+                return f'restart {gen}->{next_gen}; DRAM=0; SSD={ssd:g}>={old_ssd:g}; Keys={keys}>={old_keys}'
+        else:
+            stable = None
+        last = snapshot
+        time.sleep(0.5)
+    raise RuntimeError(f'SSD recovery failed: before={old_dram, old_ssd, old_keys}; after={last}')
+
+def drop_ssd_page_cache():
+    """Flush and evict cached pages for this exact Mooncake SSD session."""
+    if SSD_OFFLOAD_PATH is None:
+        raise RuntimeError('SSD offload path was not initialized')
+    has_posix_drop = hasattr(os, 'posix_fadvise') and hasattr(os, 'POSIX_FADV_DONTNEED')
+    has_darwin_nocache = sys.platform == 'darwin' and hasattr(fcntl, 'F_NOCACHE')
+    if not has_posix_drop and not has_darwin_nocache:
+        raise RuntimeError('Python/OS does not provide a supported file-cache eviction API')
+    required_flags = ('O_CLOEXEC', 'O_NOFOLLOW')
+    if any(not hasattr(os, name) for name in required_flags):
+        raise RuntimeError('Python/OS does not provide safe no-follow file-open flags')
+
+    root = SSD_OFFLOAD_PATH.resolve(strict=True)
+    files = []
+    total_bytes = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        directory = Path(dirpath)
+        for dirname in dirnames:
+            child = directory / dirname
+            if child.is_symlink():
+                raise RuntimeError(f'refusing symbolic-link directory in SSD session: {child}')
+        for filename in filenames:
+            path = directory / filename
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise RuntimeError(f'refusing symbolic-link file in SSD session: {path}')
+            if not stat.S_ISREG(metadata.st_mode):
+                raise RuntimeError(f'refusing non-regular file in SSD session: {path}')
+            resolved = path.resolve(strict=True)
+            if not resolved.is_relative_to(root):
+                raise RuntimeError(f'SSD file escaped its verified session path: {path}')
+            files.append(path)
+            total_bytes += metadata.st_size
+    if not files:
+        raise RuntimeError(f'no SSD data files exist before R4: {root}')
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    for path in files:
+        descriptor = os.open(path, flags)
+        try:
+            os.fsync(descriptor)
+            if has_posix_drop:
+                os.posix_fadvise(descriptor, 0, 0, os.POSIX_FADV_DONTNEED)
+            else:  # macOS-only test/development fallback; production is Linux.
+                fcntl.fcntl(descriptor, fcntl.F_NOCACHE, 1)
+        except OSError as error:
+            raise RuntimeError(f'cannot flush/drop SSD page cache for {path}: {error}') from error
+        finally:
+            os.close(descriptor)
+    return f'SSD page cache flushed/dropped: files={len(files)}, bytes={total_bytes}'
+
+def cache_metrics():
+    try:
+        text = fetch(f'http://{HOST}:{PORT}/metrics')
+    except Exception:
+        return {name: None for name in CACHE_PAIRS}
+    result = {}
+    for label, pairs in CACHE_PAIRS.items():
+        result[label] = None
+        for query_name, hit_name in pairs:
+            queries = metric_sum(text, query_name)
+            hits = metric_sum(text, hit_name)
+            if queries is not None and hits is not None:
+                result[label] = (queries, hits)
+                break
+    return result
+
+def cache_delta(before, after):
+    result = {}
+    for label in CACHE_PAIRS:
+        first, last = (before.get(label), after.get(label))
+        if first is None or last is None:
+            result[label] = None
+            continue
+        queries = last[0] - first[0]
+        hits = last[1] - first[1]
+        result[label] = {'queries': queries, 'hits': hits, 'rate': hits / queries if queries > 0 else None}
+    return result
+
+def rate_text(value):
+    return f'{value:.2%}' if value is not None else 'N/A'
+
+def size_text(value):
+    if value is None:
+        return 'N/A'
+    value = float(value)
+    for unit in ('B', 'K', 'M', 'G', 'T'):
+        if abs(value) < 1024 or unit == 'T':
+            return f'{value:.1f}{unit}'
+        value /= 1024
+
+def short_rate(value):
+    return f'{value:.1%}' if value is not None else 'N/A'
+
+def mooncake_summary():
+    try:
+        return fetch(MOONCAKE_URL).strip()
+    except Exception:
+        return ''
+
+def mooncake_keys(summary=None):
+    summary = mooncake_summary() if summary is None else summary
+    match = re.search('Keys:\\s*(\\d+)', summary, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+def reset_local(label):
+    before = mooncake_keys()
+    url = f'http://{HOST}:{PORT}/reset_prefix_cache?reset_running_requests=false&reset_connector=false'
+    request = urllib.request.Request(url, data=b'', method='POST')
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = response.read().decode('utf-8', 'replace').strip()
+            if response.status != 200 or body.lower() in ('false', '0'):
+                raise RuntimeError(f'HTTP {response.status}: {body}')
+    except Exception as error:
+        raise RuntimeError('local cache reset failed; start vLLM with VLLM_SERVER_DEV_MODE=1') from error
+    after = mooncake_keys()
+    if before is not None and after != before:
+        raise RuntimeError(f'Mooncake Keys changed during {label}: {before} -> {after}')
+    return f'{label}: HTTP 200; Mooncake Keys {before} -> {after}'
+
+def wait_stable(read_value, reached, label):
+    deadline = time.monotonic() + STORE_TIMEOUT_SECONDS
+    last = stable = None
+    while time.monotonic() < deadline:
+        current = read_value()
+        if reached(current) and current == last:
+            stable = stable or time.monotonic()
+            if time.monotonic() - stable >= STORE_STABLE_SECONDS:
+                return current
+        else:
+            stable = None
+        last = current
+        time.sleep(0.5)
+    raise RuntimeError(f'{label} not stable: {last}')
+
+def wait_mooncake_settle(keys_before):
+    read_value = lambda: (mooncake_keys(), tier_metrics().get('dram_allocated_bytes'))
+    return wait_stable(read_value, lambda value: value[0] is not None and value[0] > (keys_before or 0) and value[1] is not None, 'Mooncake DRAM')
+
+def wait_ssd_replicas(ssd_bytes_before, minimum_increase):
+    read_value = lambda: tier_metrics().get('ssd_allocated_bytes')
+    reached = lambda value: value is not None and value - ssd_bytes_before >= minimum_increase > 0
+    return wait_stable(read_value, reached, f'SSD increase>={minimum_increase}')
+
+def completion_prompt(body):
+    try:
+        data = json.loads(body.decode('utf-8'))
+    except Exception:
+        return ''
+    prompt = data.get('prompt') if isinstance(data, dict) else None
+    if isinstance(prompt, str):
+        return prompt
+    if isinstance(prompt, list):
+        return json.dumps(prompt, ensure_ascii=False, separators=(',', ':'))
+    return ''
+
+class CaptureProxyHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _handle(self):
+        length = int(self.headers.get('Content-Length', '0') or 0)
+        request_body = self.rfile.read(length) if length else b''
+        path = self.path.split('?', 1)[0]
+        request_id = self.headers.get('x-request-id', '')
+        record = None
+        if self.command == 'POST' and path.endswith('/v1/completions'):
+            with CAPTURE_LOCK:
+                if CAPTURE_PREFIX:
+                    capture_index = len(CAPTURE_RECORDS)
+                    request_id = request_id or f'{CAPTURE_PREFIX}{capture_index}'
+                    record = {'request_id': request_id, 'capture_index': capture_index, 'prompt': completion_prompt(request_body), 'status': None, 'error': ''}
+                    CAPTURE_RECORDS.append(record)
+        connection = http.client.HTTPConnection(HOST, PORT, timeout=1800)
+        headers = {}
+        for key, value in self.headers.items():
+            if key.lower() in ('host', 'content-length', 'connection', 'accept-encoding'):
+                continue
+            headers[key] = value
+        if record is not None:
+            headers['x-request-id'] = record['request_id']
+        headers['Host'] = f'{HOST}:{PORT}'
+        try:
+            connection.request(self.command, self.path, body=request_body, headers=headers)
+            upstream = connection.getresponse()
+            self.send_response(upstream.status)
+            for key, value in upstream.getheaders():
+                if key.lower() in ('content-length', 'transfer-encoding', 'connection', 'keep-alive'):
+                    continue
+                self.send_header(key, value)
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            while True:
+                chunk = upstream.read1(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+            self.close_connection = True
+            if record is not None:
+                record['status'] = upstream.status
+        except Exception as error:
+            if record is not None:
+                record['status'] = 502
+                record['error'] = str(error)
+            try:
+                self.send_response(502)
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                self.wfile.write(str(error).encode('utf-8', 'replace'))
+            except Exception:
+                pass
+        finally:
+            connection.close()
+
+    def do_GET(self):
+        self._handle()
+
+    def do_POST(self):
+        self._handle()
+
+def start_capture_proxy():
+    global BENCH_HOST, BENCH_PORT
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), CaptureProxyHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    BENCH_HOST = '127.0.0.1'
+    BENCH_PORT = server.server_address[1]
+    return server
+
+def begin_capture(prefix):
+    global CAPTURE_PREFIX
+    with CAPTURE_LOCK:
+        CAPTURE_RECORDS.clear()
+        CAPTURE_PREFIX = prefix
+
+def captured_prompts(prefix, expected):
+    with CAPTURE_LOCK:
+        records = [dict(item) for item in CAPTURE_RECORDS]
+    if len(records) != expected:
+        observed = [record['request_id'] or '<missing>' for record in records]
+        raise RuntimeError(f'captured {len(records)}/{expected} completion requests; x-request-id={observed}')
+    indexed = []
+    for record in records:
+        request_id = record['request_id']
+        suffix = request_id[len(prefix):] if request_id.startswith(prefix) else ''
+        if not suffix.isdigit():
+            indexed = []
+            break
+        indexed.append((int(suffix), record))
+    if indexed and len({item[0] for item in indexed}) == expected:
+        indexed.sort(key=lambda item: item[0])
+        records = [item[1] for item in indexed]
+        mode = 'x-request-id'
+    else:
+        records.sort(key=lambda item: item['capture_index'])
+        mode = 'proxy-arrival-order'
+    for index, record in enumerate(records):
+        record['request_id'] = record['request_id'] or f'{prefix}{index}'
+        record['capture_mode'] = mode
+    return records
+
+def prompt_sha(prompt):
+    return hashlib.sha256(prompt.encode('utf-8')).hexdigest()
+
+def token_sha(tokens):
+    raw = json.dumps(tokens, separators=(',', ':')).encode('ascii')
+    return hashlib.sha256(raw).hexdigest()
+
+def tokenize_prompt(prompt):
+    status, data = post_json(f'http://{HOST}:{PORT}/tokenize', {'model': SERVED_MODEL_NAME, 'prompt': prompt, 'add_special_tokens': False}, timeout=300)
+    tokens = data.get('tokens') if isinstance(data, dict) else None
+    if status != 200 or not isinstance(tokens, list):
+        raise RuntimeError('/tokenize did not return a token list')
+    return tokens
+
+def seed_for(batch):
+    return BASE_SEED + CONCURRENCY * 10000 + batch
+
+def benchmark_command(vllm, stage, batch, seed, filename, request_prefix):
+    command = [*vllm, 'bench', 'serve', '--host', BENCH_HOST, '--port', str(BENCH_PORT), '--endpoint', '/v1/completions', '--backend', 'openai', '--dataset-name', 'prefix_repetition', '--num-prompts', str(CONCURRENCY), '--max-concurrency', str(CONCURRENCY), '--request-rate', 'inf', '--prefix-repetition-prefix-len', str(INPUT_LEN), '--prefix-repetition-suffix-len', '0', '--prefix-repetition-num-prefixes', str(CONCURRENCY), '--prefix-repetition-output-len', '1', '--seed', str(seed), '--disable-shuffle', '--temperature', '0', '--ignore-eos', '--num-warmups', '0', '--ready-check-timeout-sec', '0', '--request-id-prefix', request_prefix, '--disable-tqdm', '--save-result', '--save-detailed', '--result-dir', str(JSON_DIR / stage), '--result-filename', filename]
+    if MODEL:
+        command += ['--model', MODEL]
+    if SERVED_MODEL_NAME:
+        command += ['--served-model-name', SERVED_MODEL_NAME]
+    if TOKENIZER:
+        command += ['--tokenizer', TOKENIZER]
+    return command
+
+def run_command(command):
+    result = subprocess.run(command, text=True, capture_output=True)
+    if result.returncode:
+        raise RuntimeError(f'vllm bench failed: {shlex.join(command)}\nstdout:\n{result.stdout[-2000:]}\nstderr:\n{result.stderr[-4000:]}')
+
+def source_name(stage, delta, storage_delta):
+    local = delta['local'] and delta['local']['rate']
+    external = delta['external'] and delta['external']['rate']
+    if local is not None and local >= REQUIRED_SOURCE_HIT_RATE:
+        return 'HBM'
+    runtime_reads = storage_delta.get('runtime_read_bytes')
+    dram_after = storage_delta.get('dram_allocated_after') or 0
+    if (
+        local is not None and local <= MAX_MISS_RATE
+        and external is not None and external >= REQUIRED_SOURCE_HIT_RATE
+        and runtime_reads == 0 and dram_after > 0
+    ):
+        return 'DRAM'
+    device_reads = storage_delta.get('ssd_device_read_bytes')
+    ssd_after = storage_delta.get('ssd_allocated_after') or 0
+    required_reads = storage_delta.get('required_ssd_read_bytes') or 0
+    if (
+        local is not None and local <= MAX_MISS_RATE
+        and external is not None and external >= REQUIRED_SOURCE_HIT_RATE
+        and runtime_reads is not None and device_reads is not None
+        and device_reads >= runtime_reads >= required_reads > 0 and ssd_after > 0
+    ):
+        return 'SSD'
+    if stage == 'R1-warmup' and local is not None and external is not None and local <= MAX_MISS_RATE and external <= MAX_MISS_RATE:
+        return 'MISS'
+    return 'MISS_OR_MIXED'
+
+def cache_valid(stage, delta, storage_delta, restart_verified=False):
+    local = delta['local'] and delta['local']['rate']
+    external = delta['external'] and delta['external']['rate']
+    if local is None or external is None:
+        return (False, 'cache counters unavailable')
+    if stage == 'R1-warmup':
+        valid = local <= MAX_MISS_RATE and external <= MAX_MISS_RATE
+        reason = f'MISS: local={rate_text(local)}, external={rate_text(external)}, max={MAX_MISS_RATE:.0%}'
+        return (valid, reason)
+    if stage == 'R2-hbm-cache':
+        valid = local >= REQUIRED_SOURCE_HIT_RATE
+        return (valid, f'HBM: local={rate_text(local)}, min={REQUIRED_SOURCE_HIT_RATE:.2%}')
+    dram_after = storage_delta.get('dram_allocated_after')
+    ssd_after = storage_delta.get('ssd_allocated_after')
+    runtime_reads = storage_delta.get('runtime_read_bytes')
+    device_read_bytes = storage_delta.get('ssd_device_read_bytes')
+    required_read_bytes = storage_delta.get('required_ssd_read_bytes') or 0
+    if None in (dram_after, ssd_after, runtime_reads, device_read_bytes):
+        return (False, 'Mooncake allocation, runtime process-I/O, or SSD block-device counter unavailable')
+    common = local <= MAX_MISS_RATE and external >= REQUIRED_SOURCE_HIT_RATE
+    if stage == 'R3-dram-cache':
+        tier_ok = dram_after > 0 and runtime_reads == 0
+        valid = common and tier_ok
+        reason = (
+            f'DRAM: local={rate_text(local)}<={MAX_MISS_RATE:.0%}, '
+            f'external={rate_text(external)}>={REQUIRED_SOURCE_HIT_RATE:.2%}, '
+            f'DRAM bytes={dram_after:g}, process reads={runtime_reads:g}, NVMe reads={device_read_bytes:g}'
+        )
+        return (valid, reason)
+    tier_ok = restart_verified and ssd_after > 0 and device_read_bytes >= runtime_reads >= required_read_bytes > 0
+    valid = common and tier_ok
+    reason = (
+        f'SSD: local={rate_text(local)}<={MAX_MISS_RATE:.0%}, '
+        f'external={rate_text(external)}>={REQUIRED_SOURCE_HIT_RATE:.2%}, restart={restart_verified}, '
+        f'SSD bytes={ssd_after:g}, process reads={runtime_reads:g}>={required_read_bytes:g}, '
+        f'NVMe reads={device_read_bytes:g}>={runtime_reads:g}'
+    )
+    return (valid, reason)
+
+def load_manifest():
+    if MANIFEST_PATH.is_file():
+        return json.loads(MANIFEST_PATH.read_text(encoding='utf-8'))
+    return {'version': 1, 'input_tokens': INPUT_LEN, 'block_size': BLOCK_SIZE, 'requests': {}}
+
+def save_manifest(manifest):
+    temporary = MANIFEST_PATH.with_suffix('.json.tmp')
+    temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+    temporary.replace(MANIFEST_PATH)
+
+def add_manifest_batch(manifest, batch, seed, captures):
+    requests = manifest['requests']
+    existing_full = {entry['prompt_sha256'] for entry in requests.values()}
+    existing_first = {entry['first_block_sha256'] for entry in requests.values()}
+    additions = []
+    for index, capture in enumerate(captures, 1):
+        prompt_id = f'C{CONCURRENCY}-B{batch}-Q{index}'
+        if prompt_id in requests:
+            raise RuntimeError(f'{prompt_id} already exists; restart vLLM/Mooncake for a new cold run')
+        prompt = capture['prompt']
+        tokens = tokenize_prompt(prompt)
+        if len(tokens) != INPUT_LEN:
+            raise RuntimeError(f'{prompt_id} has {len(tokens)} tokens, expected {INPUT_LEN}')
+        full_hash = prompt_sha(prompt)
+        all_token_hash = token_sha(tokens)
+        first_hash = token_sha(tokens[:BLOCK_SIZE])
+        if full_hash in existing_full:
+            raise RuntimeError(f'duplicate full prompt detected: {prompt_id}')
+        if first_hash in existing_first:
+            raise RuntimeError(f'duplicate first {BLOCK_SIZE}-token block: {prompt_id}')
+        entry = {'prompt_id': prompt_id, 'concurrency': CONCURRENCY, 'batch': batch, 'request_index': index, 'seed': seed, 'input_tokens': len(tokens), 'prompt_sha256': full_hash, 'token_sha256': all_token_hash, 'first_block_sha256': first_hash}
+        additions.append((entry, prompt))
+        existing_full.add(full_hash)
+        existing_first.add(first_hash)
+    for entry, _ in additions:
+        requests[entry['prompt_id']] = entry
+    save_manifest(manifest)
+    with PROMPTS_PATH.open('a', encoding='utf-8') as prompt_file:
+        for entry, prompt in additions:
+            prompt_file.write(json.dumps({'prompt_id': entry['prompt_id'], 'prompt': prompt}, ensure_ascii=False) + '\n')
+    return [entry for entry, _ in additions]
+
+def stage_prompt_hashes(captures):
+    return [prompt_sha(capture['prompt']) for capture in captures]
+
+def result_arrays(data):
+    ttfts = data.get('ttfts') or []
+    errors = data.get('errors') or []
+    completed = sum((1 for index in range(CONCURRENCY) if index < len(ttfts) and ttfts[index] is not None and (not (errors[index] if index < len(errors) else None))))
+    return (completed, CONCURRENCY - completed)
+
+def run_stage(vllm, stage, batch, seed, expected_entries, reset_evidence='', restart_verified=False, required_ssd_read_bytes=0):
+    stage_slug = stage.split('-', 1)[0].lower()
+    request_prefix = f'p1-c{CONCURRENCY}-b{batch}-{stage_slug}-'
+    filename = f'c{CONCURRENCY:03d}-b{batch:02d}-{stage_slug}.json'
+    output_path = JSON_DIR / stage / filename
+    (JSON_DIR / stage).mkdir(parents=True, exist_ok=True)
+    begin_capture(request_prefix)
+    before = cache_metrics()
+    tier_before = tier_metrics()
+    runtime_reads_before = runtime_read_bytes()
+    device_reads_before = ssd_device_read_bytes()
+    run_command(benchmark_command(vllm, stage, batch, seed, filename, request_prefix))
+    after = cache_metrics()
+    tier_after = tier_metrics()
+    runtime_reads_after = runtime_read_bytes()
+    device_reads_after = ssd_device_read_bytes()
+    data = json.loads(output_path.read_text(encoding='utf-8'))
+    captures = captured_prompts(request_prefix, CONCURRENCY)
+    delta = cache_delta(before, after)
+    storage_delta = tier_delta(tier_before, tier_after)
+    storage_delta.update({
+        'dram_allocated_before': tier_before.get('dram_allocated_bytes'),
+        'dram_allocated_after': tier_after.get('dram_allocated_bytes'),
+        'ssd_allocated_before': tier_before.get('ssd_allocated_bytes'),
+        'ssd_allocated_after': tier_after.get('ssd_allocated_bytes'),
+        'runtime_read_bytes': (
+            runtime_reads_after - runtime_reads_before
+            if runtime_reads_before is not None and runtime_reads_after is not None
+            else None
+        ),
+        'required_ssd_read_bytes': required_ssd_read_bytes,
+    })
+    storage_delta['ssd_device_read_bytes'] = (
+        device_reads_after - device_reads_before
+        if device_reads_before is not None and device_reads_after is not None
+        else None
+    )
+    completed, failed = result_arrays(data)
+    hashes = stage_prompt_hashes(captures)
+    input_lens = data.get('input_lens') or []
+    input_valid = len(input_lens) >= CONCURRENCY and all((input_lens[index] == INPUT_LEN for index in range(CONCURRENCY)))
+    if expected_entries is None:
+        identity_valid = len(hashes) == len(set(hashes)) == CONCURRENCY
+    else:
+        identity_valid = sorted(hashes) == sorted((item['prompt_sha256'] for item in expected_entries))
+    successful = completed == CONCURRENCY
+    cache_ok, cache_reason = cache_valid(stage, delta, storage_delta, restart_verified)
+    valid = successful and input_valid and identity_valid and cache_ok
+    reason_parts = [cache_reason]
+    if not successful:
+        reason_parts.append(f'request success {completed}/{CONCURRENCY}')
+    if not input_valid:
+        reason_parts.append(f'not all input_lens are {INPUT_LEN}')
+    if not identity_valid:
+        reason_parts.append('prompt hashes do not match the fixed batch P1')
+    source = source_name(stage, delta, storage_delta)
+    return {'stage': stage, 'batch': batch, 'seed': seed, 'filename': filename, 'data': data, 'captures': captures, 'hashes': hashes, 'delta': delta, 'storage_delta': storage_delta, 'completed': completed, 'failed': failed, 'input_valid': input_valid, 'identity_valid': identity_valid, 'source': source, 'valid': valid, 'reason': '; '.join(reason_parts), 'reset_evidence': reset_evidence}
+
+def raw_rows_for(stage_result, entries):
+    data = stage_result['data']
+    ttfts = data.get('ttfts') or []
+    errors = data.get('errors') or []
+    input_lens = data.get('input_lens') or []
+    output_lens = data.get('output_lens') or []
+    generated = data.get('generated_texts') or []
+    rows = []
+    for index, entry in enumerate(entries):
+        error = errors[index] if index < len(errors) else 'missing result'
+        ttft = ttfts[index] if index < len(ttfts) else None
+        request_valid = stage_result['valid'] and ttft is not None and (not error)
+        rows.append([stage_result['stage'], CONCURRENCY, stage_result['batch'], entry['prompt_id'], index + 1, stage_result['seed'], float(ttft) if ttft is not None else '', input_lens[index] if index < len(input_lens) else '', output_lens[index] if index < len(output_lens) else '', entry['prompt_sha256'], entry['token_sha256'], entry['first_block_sha256'], generated[index] if index < len(generated) else '', stage_result['source'], 'yes' if request_valid else 'no', error or '', stage_result['filename']])
+    return rows
+
+def validation_row(stage_result):
+    local = stage_result['delta']['local']
+    external = stage_result['delta']['external']
+    tier = stage_result['storage_delta']
+    tier_value = lambda name: tier.get(name) if tier.get(name) is not None else ''
+    return [
+        CONCURRENCY, stage_result['batch'], stage_result['stage'], stage_result['completed'], stage_result['failed'],
+        'yes' if stage_result['identity_valid'] else 'no', 'yes' if stage_result['input_valid'] else 'no',
+        local['queries'] if local else '', local['hits'] if local else '', rate_text(local['rate'] if local else None),
+        external['queries'] if external else '', external['hits'] if external else '', rate_text(external['rate'] if external else None),
+        tier_value('dram_allocated_before'), tier_value('dram_allocated_after'),
+        tier_value('ssd_allocated_before'), tier_value('ssd_allocated_after'),
+        tier_value('runtime_read_bytes'), tier_value('ssd_device_read_bytes'), stage_result['source'],
+        'yes' if stage_result['valid'] else 'no', stage_result['reason'], stage_result['reset_evidence'],
+        tier_value('required_ssd_read_bytes'),
+    ]
+RAW_HEADER = ['stage', 'concurrency', 'batch', 'prompt_id', 'request_index', 'seed', 'ttft_seconds', 'input_tokens', 'output_tokens', 'prompt_sha256', 'token_sha256', 'first_block_sha256', 'output_text', 'source', 'valid_request', 'error', 'result_file']
+VALIDATION_HEADER = ['concurrency', 'batch', 'stage', 'completed', 'failed', 'prompt_identity_valid', 'input_length_valid', 'local_queries', 'local_hits', 'local_rate', 'external_queries', 'external_hits', 'external_rate', 'dram_allocated_before', 'dram_allocated_after', 'ssd_allocated_before', 'ssd_allocated_after', 'runtime_read_bytes', 'ssd_device_read_bytes', 'source', 'valid_batch', 'reason', 'reset_evidence', 'required_ssd_read_bytes']
+
+def col_name(index):
+    name = ''
+    while index >= 0:
+        name = chr(65 + index % 26) + name
+        index = index // 26 - 1
+    return name
+
+def clean_excel_text(value):
+    text = ''.join(
+        char for char in str(value)
+        if ord(char) in (9, 10, 13)
+        or 0x20 <= ord(char) <= 0xD7FF
+        or 0xE000 <= ord(char) <= 0xFFFD
+        or 0x10000 <= ord(char) <= 0x10FFFF
+    )
+    encoded = text.encode('utf-16-le')
+    if len(encoded) > 65534:
+        text = encoded[:65534].decode('utf-16-le', errors='ignore')
+    return text
+
+def is_excel_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+def shared_strings(sheets):
+    values = []
+    indexes = {}
+    count = 0
+    for rows in sheets.values():
+        for row in rows:
+            for value in row:
+                if value in (None, '') or is_excel_number(value):
+                    continue
+                count += 1
+                text = clean_excel_text(value)
+                if text not in indexes:
+                    indexes[text] = len(values)
+                    values.append(text)
+    items = ''.join(f'<si><t xml:space="preserve">{escape(value)}</t></si>' for value in values)
+    xml = f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="{count}" uniqueCount="{len(values)}">{items}</sst>'
+    return indexes, xml
+
+def sheet_xml(rows, string_indexes):
+    body = []
+    for row_number, row in enumerate(rows, 1):
+        cells = []
+        for column_number, value in enumerate(row):
+            reference = f'{col_name(column_number)}{row_number}'
+            if value in (None, ''):
+                continue
+            if is_excel_number(value):
+                cells.append(f'<c r="{reference}"><v>{value}</v></c>')
+            else:
+                index = string_indexes[clean_excel_text(value)]
+                cells.append(f'<c r="{reference}" t="s"><v>{index}</v></c>')
+        body.append(f'''<row r="{row_number}">{''.join(cells)}</row>''')
+    last_column = col_name(max((len(row) for row in rows), default=1) - 1)
+    last_row = max(len(rows), 1)
+    return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:{last_column}{last_row}"/><sheetData>{''.join(body)}</sheetData></worksheet>"""
+
+def write_xlsx(path, sheets):
+    string_indexes, strings_xml = shared_strings(sheets)
+    content = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+    relationships = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    sheet_tags = ''
+    for index, name in enumerate(sheets, 1):
+        content += f'<Override PartName="/xl/worksheets/sheet{index}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        relationships += f'<Relationship Id="rId{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{index}.xml"/>'
+        sheet_tags += f'<sheet name="{escape(name)}" sheetId="{index}" r:id="rId{index}"/>'
+    content += '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>'
+    relationships += f'<Relationship Id="rId{len(sheets) + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>'
+    content += '</Types>'
+    relationships += '</Relationships>'
+    workbook = f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>{sheet_tags}</sheets></workbook>'
+    root_relationships = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'
+    with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr('[Content_Types].xml', content)
+        archive.writestr('_rels/.rels', root_relationships)
+        archive.writestr('xl/workbook.xml', workbook)
+        archive.writestr('xl/_rels/workbook.xml.rels', relationships)
+        archive.writestr('xl/sharedStrings.xml', strings_xml)
+        for index, rows in enumerate(sheets.values(), 1):
+            archive.writestr(f'xl/worksheets/sheet{index}.xml', sheet_xml(rows, string_indexes))
+
+def percent_change(current, baseline):
+    if current is None or baseline in (None, 0):
+        return ''
+    return (current / baseline - 1) * 100
+
+def completed_payloads():
+    payloads = {}
+    for path in RUN_DIR.glob('C*-result.json'):
+        try:
+            payload = json.loads(path.read_text(encoding='utf-8'))
+            payloads[int(payload['concurrency'])] = payload
+        except Exception as error:
+            raise RuntimeError(f'invalid result file {path}: {error}') from error
+    return dict(sorted(payloads.items()))
+
+def rebuild_workbook():
+    payloads = completed_payloads()
+    summary = [['Concurrency', 'R1-Warmup-TTFT(s)', 'R2-HBM-TTFT(s)', 'R3-DRAM-TTFT(s)', 'R4-SSD-TTFT(s)', 'R3/R2-Degradation(s)', 'R3/R2-Degradation(%)', 'R4/R2-Degradation(s)', 'R4/R2-Degradation(%)', 'R4/R3-Degradation(s)', 'R4/R3-Degradation(%)', 'Success/All']]
+    stage_sheets = {stage: [RAW_HEADER] for stage in STAGES}
+    validation = [VALIDATION_HEADER]
+    for concurrency, payload in payloads.items():
+        for stage in STAGES:
+            stage_sheets[stage].extend(payload['stage_rows'].get(stage, []))
+        validation.extend(payload['validation_rows'])
+    manifest = load_manifest()
+    manifest_rows = [['prompt_id', 'concurrency', 'batch', 'request_index', 'seed', 'input_tokens', 'prompt_sha256', 'token_sha256', 'first_block_sha256']]
+    manifest_rows.extend(([item['prompt_id'], item['concurrency'], item['batch'], item['request_index'], item['seed'], item['input_tokens'], item['prompt_sha256'], item['token_sha256'], item['first_block_sha256']] for item in sorted(manifest['requests'].values(), key=lambda value: (value['concurrency'], value['batch'], value['request_index']))))
+    for concurrency, payload in payloads.items():
+        values = payload['stage_summary']
+        r1 = values['R1-warmup']['avg_ttft_seconds']
+        r2 = values['R2-hbm-cache']['avg_ttft_seconds']
+        r3 = values['R3-dram-cache']['avg_ttft_seconds']
+        r4 = values['R4-ssd-cache']['avg_ttft_seconds']
+        successful = sum(values[stage]['successful_requests'] for stage in STAGES)
+        total = sum(values[stage]['total_requests'] for stage in STAGES)
+        r3_r2 = r3 - r2 if r2 is not None and r3 is not None else ''
+        r4_r2 = r4 - r2 if r2 is not None and r4 is not None else ''
+        r4_r3 = r4 - r3 if r3 is not None and r4 is not None else ''
+        summary.append([f'C{concurrency}', r1 if r1 is not None else '', r2 if r2 is not None else '', r3 if r3 is not None else '', r4 if r4 is not None else '', r3_r2, percent_change(r3, r2), r4_r2, percent_change(r4, r2), r4_r3, percent_change(r4, r3), f'{successful}/{total}'])
+    sheets = {'Summary': summary, **stage_sheets}
+    sheets['validation'] = validation
+    sheets['P1-manifest'] = manifest_rows
+    write_xlsx(WORKBOOK_PATH, sheets)
+
+def build_payload(stage_rows, validation_rows):
+    summary_rows = []
+    stage_summary = {}
+    for stage in STAGES:
+        values = [float(row[6]) for row in stage_rows[stage] if row[14] == 'yes' and row[6] != '']
+        total = CONCURRENCY * BATCHES
+        successful = sum((1 for row in stage_rows[stage] if row[6] != '' and (not row[15])))
+        item = {'successful_requests': successful, 'total_requests': total, 'success_rate_percent': successful / total * 100 if total else 0, 'ttft_samples': len(values), 'avg_ttft_seconds': statistics.fmean(values) if values else None, 'min_ttft_seconds': min(values) if values else None, 'max_ttft_seconds': max(values) if values else None}
+        stage_summary[stage] = item
+        summary_rows.append([stage, CONCURRENCY, item['successful_requests'], item['total_requests'], item['success_rate_percent'], item['ttft_samples'], item['avg_ttft_seconds'] if item['avg_ttft_seconds'] is not None else '', item['min_ttft_seconds'] if item['min_ttft_seconds'] is not None else '', item['max_ttft_seconds'] if item['max_ttft_seconds'] is not None else ''])
+    return {'created_at': now_cn(), 'concurrency': CONCURRENCY, 'batches': BATCHES, 'input_tokens': INPUT_LEN, 'block_size': BLOCK_SIZE, 'stage_rows': stage_rows, 'validation_rows': validation_rows, 'summary_rows': summary_rows, 'stage_summary': stage_summary}
+
+def clear_generated_session():
+    if JSON_DIR.parent.is_dir():
+        shutil.rmtree(JSON_DIR.parent)
+    for path in RUN_DIR.glob('C*-result.json'):
+        path.unlink()
+    for path in (SESSION_PATH, MANIFEST_PATH, PROMPTS_PATH, WORKBOOK_PATH):
+        path.unlink(missing_ok=True)
+
+def prepare_session():
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    keys = mooncake_keys()
+    if keys is None and STRICT:
+        sys.exit(f'cannot read Mooncake Keys from {MOONCAKE_URL}')
+    if NEW_SESSION:
+        if keys not in (None, 0):
+            sys.exit(f'new session requires empty Mooncake, but Keys={keys}; restart vLLM/Mooncake')
+        clear_generated_session()
+    if SESSION_PATH.is_file():
+        session = json.loads(SESSION_PATH.read_text(encoding='utf-8'))
+        if session.get('model') != MODEL or session.get('input_tokens') != INPUT_LEN:
+            sys.exit('existing VB_RUN_DIR belongs to a different model/input length')
+        if RESULT_PATH.is_file():
+            sys.exit(f'{RESULT_PATH} already exists; R1 cannot be repeated cold without restarting vLLM/Mooncake and using a new session')
+        if session.get('completed_concurrencies') and keys in (None, 0):
+            sys.exit('Mooncake is empty but this session already has results; start a new session')
+        return session
+    if keys not in (None, 0):
+        sys.exit(f'first concurrency requires empty Mooncake, but Keys={keys}; restart vLLM/Mooncake')
+    config_bytes = MOONCAKE_CONFIG.read_bytes()
+    storage_config = json.loads(config_bytes.decode('utf-8'))
+    session = {
+        'created_at': now_cn(), 'model': MODEL, 'served_model_name': SERVED_MODEL_NAME,
+        'input_tokens': INPUT_LEN, 'block_size': BLOCK_SIZE, 'batches': BATCHES,
+        'expected_concurrencies': EXPECTED_CONCURRENCIES,
+        'storage_tiers': ['HBM', 'DRAM', 'SSD'],
+        'tier_evidence': 'local/external counters + DRAM/SSD bytes + cache drop + process/NVMe reads',
+        'required_source_hit_rate': REQUIRED_SOURCE_HIT_RATE,
+        'ssd_replica_blocks': SSD_REPLICA_BLOCKS,
+        'ssd_replica_rate': SSD_REPLICA_RATE,
+        'ssd_offload_path': storage_config.get('ssd_offload_path'),
+        'ssd_device': storage_config.get('benchmark_ssd_block_source') or storage_config.get('benchmark_ssd_source'),
+        'ssd_fstype': storage_config.get('benchmark_ssd_fstype'),
+        'ssd_kname': storage_config.get('benchmark_ssd_kname'),
+        'ssd_io_mode': storage_config.get('benchmark_ssd_io_mode'),
+        'ssd_page_cache_drop': storage_config.get('benchmark_ssd_page_cache_drop'),
+        'mooncake_config_sha256': hashlib.sha256(config_bytes).hexdigest(),
+        'ssd_transition': {
+            'mode': storage_config.get('benchmark_runtime_control'),
+            'restart_timeout_seconds': RUNTIME_RESTART_TIMEOUT_SECONDS,
+            'preserve_ssd_session': True,
+        },
+        'completed_concurrencies': [],
+    }
+    SESSION_PATH.write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding='utf-8')
+    return session
+
+def verify_preconditions():
+    global SSD_BLOCK_STAT, SSD_OFFLOAD_PATH, ROOT_PID, START_TICKS, REQUEST_PATH, STATUS_PATH
+    metrics = cache_metrics()
+    if metrics['local'] is None or metrics['external'] is None:
+        sys.exit('local/external prefix-cache counters are unavailable on /metrics')
+    if not MOONCAKE_CONFIG.is_file():
+        sys.exit(f'Mooncake config not found: {MOONCAKE_CONFIG}')
+    config = json.loads(MOONCAKE_CONFIG.read_text(encoding='utf-8'))
+    if not config.get('enable_ssd_offload'):
+        sys.exit('SSD offload is disabled; run the SSD-enabled StartUp.sh before Run-all')
+    if not config.get('benchmark_ssd_verified'):
+        sys.exit('SSD path was not verified as a non-rotating block device by StartUp.sh')
+    if not config.get('benchmark_ssd_page_cache_drop'):
+        sys.exit('StartUp.sh did not enable the required per-R4 SSD page-cache drop')
+    if config.get('benchmark_ssd_io_mode') != 'posix-fadvise-dontneed':
+        sys.exit(f'unsupported SSD I/O validation mode: {config.get("benchmark_ssd_io_mode")!r}')
+    ssd_kname = config.get('benchmark_ssd_kname')
+    if not ssd_kname or '/' in ssd_kname:
+        sys.exit(f'invalid or missing verified SSD kernel device name: {ssd_kname!r}')
+    stat_override = os.environ.get('VB_SSD_BLOCK_STAT_PATH')
+    SSD_BLOCK_STAT = Path(stat_override) if stat_override else Path('/sys/class/block') / ssd_kname / 'stat'
+    if ssd_device_read_bytes() is None:
+        sys.exit(f'SSD block-device read counter is unavailable: {SSD_BLOCK_STAT}')
+    ROOT_PID = int(config.get('benchmark_startup_pid') or 0)
+    START_TICKS = str(config.get('benchmark_startup_start_ticks') or '')
+    if ROOT_PID <= 1 or not START_TICKS:
+        sys.exit('StartUp runtime identity is missing')
+    if process_start_ticks(ROOT_PID) != START_TICKS:
+        sys.exit(f'StartUp runtime process is unavailable or PID was reused: {ROOT_PID}')
+    if config.get('benchmark_runtime_control') != 'signal-request-v1':
+        sys.exit('启动代码不支持SSD保留重启；请重新复制执行最新版StartUp.sh内容')
+    expected_request_path = Path(f'/tmp/mooncake-benchmark-{ROOT_PID}.request')
+    expected_status_path = Path(f'/tmp/mooncake-benchmark-{ROOT_PID}.status')
+    REQUEST_PATH = Path(config.get('benchmark_runtime_request_path') or '')
+    STATUS_PATH = Path(config.get('benchmark_runtime_status_path') or '')
+    if REQUEST_PATH != expected_request_path or STATUS_PATH != expected_status_path:
+        sys.exit('unsafe or mismatched StartUp runtime control paths')
+    if runtime_read_bytes() is None:
+        sys.exit(f'benchmark runtime process-tree read counter is unavailable: root PID {ROOT_PID}')
+    ssd_path = config.get('ssd_offload_path')
+    if not ssd_path or not Path(ssd_path).is_absolute() or not Path(ssd_path).is_dir():
+        sys.exit(f'invalid or missing SSD offload directory: {ssd_path!r}')
+    SSD_OFFLOAD_PATH = Path(ssd_path)
+    try:
+        status = read_runtime_status()
+    except RuntimeError as error:
+        sys.exit(str(error))
+    if status.get('state') != 'ready':
+        sys.exit(f'StartUp runtime is not ready: {status}')
+    has_posix_drop = hasattr(os, 'posix_fadvise') and hasattr(os, 'POSIX_FADV_DONTNEED')
+    has_darwin_nocache = sys.platform == 'darwin' and hasattr(fcntl, 'F_NOCACHE')
+    if not has_posix_drop and not has_darwin_nocache:
+        sys.exit('Python/OS lacks the file-cache eviction API required for reliable R4 validation')
+discover_model()
+verify_preconditions()
+session = prepare_session()
+JSON_DIR.mkdir(parents=True, exist_ok=True)
+manifest = load_manifest()
+if manifest.get('input_tokens') != INPUT_LEN or manifest.get('block_size') != BLOCK_SIZE:
+    sys.exit('P1 manifest input length/block size does not match this run')
+vllm = vllm_command()
+proxy = start_capture_proxy()
+stage_rows = {stage: [] for stage in STAGES}
+validation_rows = []
+invalid_batches = []
+batch_contexts = []
+print(f'Concurrency=C{CONCURRENCY}; batches={BATCHES}; input={INPUT_LEN}; model={MODEL}; run_dir={RUN_DIR}')
+
+def record_result(result, entries):
+    stage_rows[result['stage']].extend(raw_rows_for(result, entries))
+    validation_rows.append(validation_row(result))
+    if not result['valid']:
+        invalid_batches.append((result['batch'], result['stage'], result['reason']))
+    tier = result['storage_delta']
+    local = result['delta']['local']
+    external = result['delta']['external']
+    local_rate = short_rate(local['rate'] if local else None)
+    external_rate = short_rate(external['rate'] if external else None)
+    if result['stage'] == 'R1-warmup':
+        evidence = f'理由=本地{local_rate},外部{external_rate}'
+    elif result['stage'] == 'R2-hbm-cache':
+        evidence = f'理由=本地{local_rate}'
+    elif result['stage'] == 'R3-dram-cache':
+        evidence = f'理由=本地{local_rate},外部{external_rate},DRAM{size_text(tier.get("dram_allocated_after"))},读盘{size_text(tier.get("runtime_read_bytes"))}'
+    else:
+        evidence = f'理由=本地{local_rate},外部{external_rate},读盘{size_text(tier.get("runtime_read_bytes"))}/{size_text(tier.get("required_ssd_read_bytes"))},NVMe≥读盘'
+    stage = result['stage'].split('-', 1)[0]
+    state = 'OK' if result['valid'] else 'X'
+    print(f'  {stage} {result["source"]} | {evidence} | {state}')
+
+def print_terminal_table(payload):
+    print('\n+-------+---------------+----------+-------+')
+    print('| Stage | Tier          | TTFT(s)  | Valid |')
+    print('+-------+---------------+----------+-------+')
+    for stage in STAGES:
+        rows = [row for row in payload['validation_rows'] if row[2] == stage]
+        tiers = {row[19] for row in rows}
+        tier = next(iter(tiers)) if len(tiers) == 1 else 'MIXED'
+        valid = sum(row[20] == 'yes' for row in rows)
+        average = payload['stage_summary'][stage]['avg_ttft_seconds']
+        ttft = f'{average:.4f}' if average is not None else '-'
+        print(f'| {stage.split("-", 1)[0]:<5} | {tier:<13} | {ttft:>8} | {valid:>2}/{len(rows):<2} |')
+    print('+-------+---------------+----------+-------+')
+
+try:
+    for batch in range(1, BATCHES + 1):
+        seed = seed_for(batch)
+        print(f'\nC{CONCURRENCY} batch {batch}/{BATCHES}; seed={seed}')
+        pre_r1_reset = reset_local('pre-R1 local reset')
+        keys_before = mooncake_keys()
+        tier_before_r1 = tier_metrics()
+        ssd_bytes_before = tier_before_r1['ssd_allocated_bytes'] or 0
+        dram_bytes_before = tier_before_r1['dram_allocated_bytes'] or 0
+        r1 = run_stage(vllm, 'R1-warmup', batch, seed, None, reset_evidence=pre_r1_reset)
+        entries = add_manifest_batch(manifest, batch, seed, r1['captures'])
+        expected_hashes = [entry['prompt_sha256'] for entry in entries]
+        r1['identity_valid'] = sorted(r1['hashes']) == sorted(expected_hashes)
+        r1['valid'] = r1['valid'] and r1['identity_valid']
+        if not r1['identity_valid']:
+            r1['reason'] += '; manifest hash mismatch'
+        print('  R1请求完成 | 正在校验DRAM与SSD副本')
+        keys_after_r1, dram_bytes_after = wait_mooncake_settle(keys_before)
+        if dram_bytes_after is None or dram_bytes_after <= dram_bytes_before:
+            raise RuntimeError(
+                f'R1 did not create a measurable DRAM copy: {dram_bytes_before} -> {dram_bytes_after}'
+            )
+        batch_dram_bytes = int(dram_bytes_after - dram_bytes_before)
+        minimum_ssd_replica_bytes = (
+            batch_dram_bytes * SSD_REPLICA_BLOCKS
+            // (INPUT_LEN // BLOCK_SIZE)
+        )
+        ssd_bytes_after = wait_ssd_replicas(ssd_bytes_before, minimum_ssd_replica_bytes)
+        batch_ssd_replica_bytes = int(ssd_bytes_after - ssd_bytes_before)
+        required_ssd_read_bytes = minimum_ssd_replica_bytes
+        print(
+            f'  SSD副本 | 实际{size_text(batch_ssd_replica_bytes)},'
+            f'最低{size_text(minimum_ssd_replica_bytes)} | OK'
+        )
+        r1['reset_evidence'] += (
+            f'; Mooncake stable Keys {keys_before} -> {keys_after_r1}; '
+            f'DRAM batch bytes={batch_dram_bytes}; eager SSD allocated bytes '
+            f'{ssd_bytes_before:g} -> {ssd_bytes_after:g}; SSD batch bytes={batch_ssd_replica_bytes} '
+            f'>= minimum {minimum_ssd_replica_bytes} ({SSD_REPLICA_BLOCKS}/'
+            f'{INPUT_LEN // BLOCK_SIZE} persistent blocks); '
+            f'R4 required physical read bytes={required_ssd_read_bytes}'
+        )
+        r2 = run_stage(vllm, 'R2-hbm-cache', batch, seed, entries)
+        pre_r3_reset = reset_local('pre-R3 local reset')
+        r3 = run_stage(vllm, 'R3-dram-cache', batch, seed, entries, reset_evidence=pre_r3_reset)
+        for result in (r1, r2, r3):
+            record_result(result, entries)
+        batch_contexts.append((batch, seed, entries, required_ssd_read_bytes))
+
+    print(f'\nC{CONCURRENCY} SSD切换 | 保留SSD，重启并清空HBM/DRAM')
+    restart_evidence = request_runtime_restart()
+    recovered_tier = tier_metrics()
+    print(
+        f'  重启完成 | DRAM=0,SSD={size_text(recovered_tier.get("ssd_allocated_bytes"))},'
+        f'键={mooncake_keys()}'
+    )
+    for batch, seed, entries, required_ssd_read_bytes in batch_contexts:
+        print(f'\nC{CONCURRENCY} batch {batch}/{BATCHES}; R4 SSD verification')
+        pre_r4_reset = reset_local('pre-R4 local reset after controlled restart')
+        cache_drop_evidence = drop_ssd_page_cache()
+        print('  R4清页缓存 | OK')
+        r4 = run_stage(vllm, 'R4-ssd-cache', batch, seed, entries, reset_evidence=f'{pre_r4_reset}; {restart_evidence}; {cache_drop_evidence}', restart_verified=True, required_ssd_read_bytes=required_ssd_read_bytes)
+        record_result(r4, entries)
+finally:
+    proxy.shutdown()
+    proxy.server_close()
+payload = build_payload(stage_rows, validation_rows)
+print_terminal_table(payload)
+RESULT_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+session['completed_concurrencies'] = sorted(set(session.get('completed_concurrencies', [])) | {CONCURRENCY})
+SESSION_PATH.write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding='utf-8')
+rebuild_workbook()
+expected_total = BATCHES * sum(session.get('expected_concurrencies', []))
+actual_total = len(load_manifest()['requests'])
+print(f'\nResult: {RESULT_PATH}')
+print(f'Workbook: {WORKBOOK_PATH}')
+print(f'P1 manifest: {actual_total}/{expected_total} unique requests')
+if invalid_batches:
+    print(f'Excluded stage-batches: {len(invalid_batches)}')
+    for batch, stage, _reason in invalid_batches:
+        print(f'  C{CONCURRENCY} B{batch} {stage.split("-", 1)[0]}: X (see validation)')
+    if STRICT:
+        sys.exit(2)
+PY
+}
+
+VB_RUN_CONCURRENCIES="${VB_RUN_CONCURRENCIES:-1,5,10,100}"
+case ",$VB_RUN_CONCURRENCIES," in
+  *,1,*|*,5,*|*,10,*|*,100,*) ;;
+  *) echo "错误：VB_RUN_CONCURRENCIES 必须包含 1、5、10 或 100"; exit 1 ;;
+esac
+IFS=, read -r -a run_concurrency_values <<< "$VB_RUN_CONCURRENCIES"
+run_first=1
+for run_value in "${run_concurrency_values[@]}"; do
+  case "$run_value" in
+    1|5|10|100) ;;
+    *) echo "错误：VB_RUN_CONCURRENCIES 包含不支持的并发：$run_value"; exit 1 ;;
+  esac
+  run_concurrency "$run_value" "$run_first"
+  run_first=0
+done
