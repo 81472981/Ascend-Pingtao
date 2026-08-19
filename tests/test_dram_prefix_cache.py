@@ -554,8 +554,7 @@ class DramPrefixCacheTest(unittest.TestCase):
                     timeout=60,
                 )
                 self.assertEqual(completed.returncode, 2)
-                self.assertIn("R4-ssd-cache", completed.stdout)
-                self.assertIn("KV来源=DRAM", completed.stdout)
+                self.assertIn("R4 DRAM", completed.stdout)
                 payload = json.loads(
                     (root / "results" / "C1-result.json").read_text(encoding="utf-8")
                 )

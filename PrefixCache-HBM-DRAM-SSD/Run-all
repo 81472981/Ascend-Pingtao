@@ -384,6 +384,18 @@ def cache_delta(before, after):
 def rate_text(value):
     return f'{value:.2%}' if value is not None else 'N/A'
 
+def size_text(value):
+    if value is None:
+        return 'N/A'
+    value = float(value)
+    for unit in ('B', 'K', 'M', 'G', 'T'):
+        if abs(value) < 1024 or unit == 'T':
+            return f'{value:.1f}{unit}'
+        value /= 1024
+
+def short_rate(value):
+    return f'{value:.1%}' if value is not None else 'N/A'
+
 def mooncake_summary():
     try:
         return fetch(MOONCAKE_URL).strip()
@@ -636,8 +648,8 @@ def evict_all_current_dram(vllm):
         last = tier_metrics()
         evicted = int((last['evicted_bytes'] or 0) - evicted_before)
         print(
-            f'  SSD pressure round={pressure_round}: evicted-bytes={evicted}/{target}, '
-            f'DRAM-bytes={int(last["dram_allocated_bytes"] or 0)}, SSD-bytes={int(last["ssd_allocated_bytes"] or 0)}'
+            f'  压力 {pressure_round:03d}: 淘汰 {size_text(evicted)}/{size_text(target)} '
+            f'D={size_text(last["dram_allocated_bytes"])} S={size_text(last["ssd_allocated_bytes"])}'
         )
         if evicted >= target:
             return (
@@ -1102,17 +1114,36 @@ def record_result(result, entries):
     validation_rows.append(validation_row(result))
     if not result['valid']:
         invalid_batches.append((result['batch'], result['stage'], result['reason']))
+    tier = result['storage_delta']
     local = result['delta']['local']
     external = result['delta']['external']
-    tier = result['storage_delta']
-    print(
-        f"  {result['stage']:<16} KV来源={result['source']:<13} "
-        f"local={rate_text(local['rate'] if local else None):>7} external={rate_text(external['rate'] if external else None):>7} "
-        f"Mooncake[DRAM allocated={tier.get('dram_allocated_after')}, "
-        f"SSD allocated={tier.get('ssd_allocated_after')}, "
-        f"runtime/required/NVMe reads={tier.get('runtime_read_bytes')}/{tier.get('required_ssd_read_bytes')}/{tier.get('ssd_device_read_bytes')}] "
-        f"依据: {result['reason']} {('VALID' if result['valid'] else 'EXCLUDED')}"
-    )
+    local_rate = short_rate(local['rate'] if local else None)
+    external_rate = short_rate(external['rate'] if external else None)
+    if result['stage'] == 'R1-warmup':
+        evidence = f'L={local_rate} E={external_rate}'
+    elif result['stage'] == 'R2-hbm-cache':
+        evidence = f'L={local_rate}'
+    elif result['stage'] == 'R3-dram-cache':
+        evidence = f'E={external_rate} D={size_text(tier.get("dram_allocated_after"))} R={size_text(tier.get("runtime_read_bytes"))}'
+    else:
+        evidence = f'E={external_rate} R={size_text(tier.get("runtime_read_bytes"))}/{size_text(tier.get("required_ssd_read_bytes"))} N={size_text(tier.get("ssd_device_read_bytes"))}'
+    stage = result['stage'].split('-', 1)[0]
+    state = 'OK' if result['valid'] else 'X'
+    print(f'  {stage:<2} {result["source"]:<13} | {evidence} | {state}')
+
+def print_terminal_table(payload):
+    print('\n+-------+---------------+----------+-------+')
+    print('| Stage | Tier          | TTFT(s)  | Valid |')
+    print('+-------+---------------+----------+-------+')
+    for stage in STAGES:
+        rows = [row for row in payload['validation_rows'] if row[2] == stage]
+        tiers = {row[19] for row in rows}
+        tier = next(iter(tiers)) if len(tiers) == 1 else 'MIXED'
+        valid = sum(row[20] == 'yes' for row in rows)
+        average = payload['stage_summary'][stage]['avg_ttft_seconds']
+        ttft = f'{average:.4f}' if average is not None else '-'
+        print(f'| {stage.split("-", 1)[0]:<5} | {tier:<13} | {ttft:>8} | {valid:>2}/{len(rows):<2} |')
+    print('+-------+---------------+----------+-------+')
 
 try:
     # Phase A: establish cold/HBM/DRAM results while each new P1 batch is
@@ -1152,13 +1183,14 @@ try:
         print(f'\nC{CONCURRENCY} batch {batch}/{BATCHES}; R4 SSD verification')
         pre_r4_reset = reset_local('pre-R4 local reset after SSD pressure')
         cache_drop_evidence = drop_ssd_page_cache()
-        print(f'  {cache_drop_evidence}')
+        print('  R4 cache-drop: OK')
         r4 = run_stage(vllm, 'R4-ssd-cache', batch, seed, entries, reset_evidence=f'{pre_r4_reset}; {eviction_evidence}; {cache_drop_evidence}', transition_verified=True, required_ssd_read_bytes=required_ssd_read_bytes)
         record_result(r4, entries)
 finally:
     proxy.shutdown()
     proxy.server_close()
 payload = build_payload(stage_rows, validation_rows)
+print_terminal_table(payload)
 RESULT_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
 session['completed_concurrencies'] = sorted(set(session.get('completed_concurrencies', [])) | {CONCURRENCY})
 SESSION_PATH.write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -1170,8 +1202,8 @@ print(f'Workbook: {WORKBOOK_PATH}')
 print(f'P1 manifest: {actual_total}/{expected_total} unique requests')
 if invalid_batches:
     print(f'Excluded stage-batches: {len(invalid_batches)}')
-    for batch, stage, reason in invalid_batches:
-        print(f'  C{CONCURRENCY} batch={batch} {stage}: {reason}')
+    for batch, stage, _reason in invalid_batches:
+        print(f'  C{CONCURRENCY} B{batch} {stage.split("-", 1)[0]}: X (see validation)')
     if STRICT:
         sys.exit(2)
 PY
