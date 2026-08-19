@@ -104,6 +104,7 @@ mkdir -p "$SSD_SESSION_PATH"
 MASTER_PID=""
 VLLM_PID=""
 VLLM_PATCH_DIR=""
+VLLM_LOG=""
 
 delete_ssd_session() {
   session_dir="$1"
@@ -141,6 +142,9 @@ cleanup_runtime() {
   if [ -n "$MASTER_PID" ]; then kill -KILL "$MASTER_PID" 2>/dev/null; fi
   if [ -n "$VLLM_PID" ]; then wait "$VLLM_PID" 2>/dev/null; fi
   if [ -n "$MASTER_PID" ]; then wait "$MASTER_PID" 2>/dev/null; fi
+  if [ -n "$VLLM_LOG" ] && [ -f "$VLLM_LOG" ]; then
+    echo "vLLM 日志保留：$VLLM_LOG"
+  fi
   case "$VLLM_PATCH_DIR" in
     /tmp/vllm-ssd-lazy-init.*)
       if [ -d "$VLLM_PATCH_DIR" ]; then
@@ -516,6 +520,8 @@ fi
 echo ""
 echo "===== [5/5] 启动 vLLM ====="
 echo "配置: SSD staging buffer=${SSD_BUFFER_MB}MB；SSD I/O=POSIX（禁用不兼容的io_uring）；Ascend中转池=$ASCEND_BUFFER_POOL；SSD初始化顺序=NPU-KV之后；max-model-len=$VLLM_MAX_MODEL_LEN；gpu-memory-utilization=$VLLM_GPU_MEMORY_UTILIZATION"
+VLLM_LOG="/tmp/vllm-ssd-$STARTUP_PID.log"
+echo "vLLM 日志: $VLLM_LOG"
 vllm serve "$MODEL_PATH" \
   --port "$PORT" \
   --trust-remote-code \
@@ -532,9 +538,9 @@ vllm serve "$MODEL_PATH" \
     "kv_connector_extra_config": {
       "backend": "mooncake",
       "lookup_rpc_port": "0",
-      "load_async": true
+      "load_async": false
     }
-  }' &
+  }' > >(tee "$VLLM_LOG") 2>&1 &
 VLLM_PID=$!
 wait "$VLLM_PID"
 )
