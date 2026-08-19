@@ -669,12 +669,21 @@ def source_name(stage, delta, storage_delta):
         return 'HBM'
     runtime_reads = storage_delta.get('runtime_read_bytes')
     dram_after = storage_delta.get('dram_allocated_after') or 0
-    if external is not None and external >= REQUIRED_SOURCE_HIT_RATE and runtime_reads == 0 and dram_after > 0:
+    if (
+        local is not None and local <= MAX_MISS_RATE
+        and external is not None and external >= REQUIRED_SOURCE_HIT_RATE
+        and runtime_reads == 0 and dram_after > 0
+    ):
         return 'DRAM'
     device_reads = storage_delta.get('ssd_device_read_bytes')
     ssd_after = storage_delta.get('ssd_allocated_after') or 0
     required_reads = storage_delta.get('required_ssd_read_bytes') or 0
-    if external is not None and external >= REQUIRED_SOURCE_HIT_RATE and runtime_reads is not None and device_reads is not None and device_reads >= runtime_reads >= required_reads > 0 and ssd_after > 0:
+    if (
+        local is not None and local <= MAX_MISS_RATE
+        and external is not None and external >= REQUIRED_SOURCE_HIT_RATE
+        and runtime_reads is not None and device_reads is not None
+        and device_reads >= runtime_reads >= required_reads > 0 and ssd_after > 0
+    ):
         return 'SSD'
     if stage == 'R1-warmup' and local is not None and external is not None and local <= MAX_MISS_RATE and external <= MAX_MISS_RATE:
         return 'MISS'
@@ -1124,9 +1133,9 @@ def record_result(result, entries):
     elif result['stage'] == 'R2-hbm-cache':
         evidence = f'理由=本地{local_rate}'
     elif result['stage'] == 'R3-dram-cache':
-        evidence = f'理由=外部{external_rate},DRAM{size_text(tier.get("dram_allocated_after"))},读盘{size_text(tier.get("runtime_read_bytes"))}'
+        evidence = f'理由=本地{local_rate},外部{external_rate},DRAM{size_text(tier.get("dram_allocated_after"))},读盘{size_text(tier.get("runtime_read_bytes"))}'
     else:
-        evidence = f'理由=外部{external_rate},读盘{size_text(tier.get("runtime_read_bytes"))}/{size_text(tier.get("required_ssd_read_bytes"))},NVMe≥读盘'
+        evidence = f'理由=本地{local_rate},外部{external_rate},读盘{size_text(tier.get("runtime_read_bytes"))}/{size_text(tier.get("required_ssd_read_bytes"))},NVMe≥读盘'
     stage = result['stage'].split('-', 1)[0]
     state = 'OK' if result['valid'] else 'X'
     print(f'  {stage} {result["source"]} | {evidence} | {state}')

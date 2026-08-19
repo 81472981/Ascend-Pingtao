@@ -357,7 +357,10 @@ def source_name(delta):
     external = delta['external'] and delta['external']['rate']
     if local is not None and local >= MIN_HIT_RATE:
         return 'HBM'
-    if external is not None and external >= MIN_HIT_RATE:
+    if (
+        local is not None and local <= MAX_MISS_RATE
+        and external is not None and external >= MIN_HIT_RATE
+    ):
         return 'DRAM'
     return 'MISS_OR_MIXED'
 
