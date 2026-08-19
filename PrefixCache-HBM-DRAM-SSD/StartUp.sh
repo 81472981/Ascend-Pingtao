@@ -336,8 +336,8 @@ unset ASCEND_USE_ASYNC_TRANSFER
 export MOONCAKE_REQUESTER_LOCAL_HOSTNAME=192.168.243.40
 
 # vLLM-Ascend 0.23.0rc1 默认在 NPU KV tensor 分配前初始化 embedded
-# Mooncake。日志显示 SSD 模式额外执行 aclrtMallocHost/io_uring 注册后，本机驱动
-# 紧接着对第一个大 KV tensor 的 aclrtMallocPhysical 返回 507899。临时 import hook 仅将
+# Mooncake。日志显示 SSD 模式额外执行 aclrtMallocHost 后，本机驱动曾在第一个大 KV
+# tensor 的 aclrtMallocPhysical 返回 507899。临时 import hook 仅将
 # contribute-memory worker 的 SSD store 延迟到 KV tensor 已分配并注册之后；
 # scheduler client、非 SSD 模式以及已安装源码都不改变。
 VLLM_PATCH_DIR=$(mktemp -d /tmp/vllm-ssd-lazy-init.XXXXXX)
@@ -452,8 +452,11 @@ export MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=$((SSD_BUFFER_MB * 1024 * 1024))
 export MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE=$((SSD_QUOTA_GB * 1024 * 1024 * 1024))
 export MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=$((SSD_QUOTA_GB * 1024 * 1024 * 1024))
 export MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY=none
-# io_uring read path 使用 O_DIRECT；R4 还会核对块设备 read-sector 增量，避免页缓存冒充 SSD。
-export MOONCAKE_OFFLOAD_USE_URING=1
+# 当前 Ascend 驱动在 io_uring_register_buffers(aclrtMallocHost buffer) 返回 EFAULT
+# 后会进入 507899 错误状态，Mooncake 的 fallback 无法恢复。因此显式使用稳定的
+# POSIX pread/pwrite 路径。Run-all 在每次 R4 前 fsync + POSIX_FADV_DONTNEED，并要求
+# 评测进程 read_bytes 覆盖完整 batch 且 NVMe read sectors 覆盖该读量，页缓存不能冒充 SSD。
+export MOONCAKE_OFFLOAD_USE_URING=0
 
 echo ""
 echo "===== [3/5] 生成 mooncake.json ====="
@@ -473,7 +476,9 @@ cat > $MOONCAKE_JSON <<EOF
   "benchmark_ssd_block_source": "$SSD_BLOCK_SOURCE",
   "benchmark_ssd_fstype": "$SSD_FSTYPE",
   "benchmark_ssd_kname": "$SSD_KNAME",
-  "benchmark_ssd_direct_io": true,
+  "benchmark_ssd_direct_io": false,
+  "benchmark_ssd_page_cache_drop": true,
+  "benchmark_ssd_io_mode": "posix-fadvise-dontneed",
   "benchmark_ssd_overlay_verified": $SSD_OVERLAY_MODE,
   "benchmark_cleanup_managed": true,
   "benchmark_startup_pid": $STARTUP_PID,
@@ -501,7 +506,7 @@ sleep 3
 if curl -s -m 2 http://127.0.0.1:$METRICS_PORT/health > /dev/null 2>&1; then
   echo "mooncake_master 启动成功"
   echo "初始状态: $(curl -s http://127.0.0.1:$METRICS_PORT/metrics/summary | grep -o 'Mem Storage: [^|]*| SSD Storage: [^|]*| Keys: [0-9]*' | head -1)"
-  echo "可靠性校验: Mooncake DRAM/SSD 分配量 + 评测进程树物理读盘 + NVMe 块设备读盘（Run-all 逐阶段强校验）"
+  echo "可靠性校验: R4 前刷盘并清 SSD 文件页缓存 + Mooncake DRAM/SSD 分配量 + 评测进程树物理读盘 + NVMe 块设备读盘"
 else
   echo "错误：mooncake_master 启动失败，查看日志："
   tail -20 /tmp/mooncake_master.log
@@ -510,7 +515,7 @@ fi
 
 echo ""
 echo "===== [5/5] 启动 vLLM ====="
-echo "配置: SSD staging buffer=${SSD_BUFFER_MB}MB；Ascend中转池=$ASCEND_BUFFER_POOL；SSD初始化顺序=NPU-KV之后；max-model-len=$VLLM_MAX_MODEL_LEN；gpu-memory-utilization=$VLLM_GPU_MEMORY_UTILIZATION"
+echo "配置: SSD staging buffer=${SSD_BUFFER_MB}MB；SSD I/O=POSIX（禁用不兼容的io_uring）；Ascend中转池=$ASCEND_BUFFER_POOL；SSD初始化顺序=NPU-KV之后；max-model-len=$VLLM_MAX_MODEL_LEN；gpu-memory-utilization=$VLLM_GPU_MEMORY_UTILIZATION"
 vllm serve "$MODEL_PATH" \
   --port "$PORT" \
   --trust-remote-code \

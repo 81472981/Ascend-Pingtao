@@ -331,6 +331,7 @@ class DramPrefixCacheTest(unittest.TestCase):
                 config = root / "mooncake.json"
                 ssd_path = root / "ssd"
                 ssd_path.mkdir()
+                (ssd_path / "bucket-0").write_bytes(b"fake-ssd-kv")
                 block_stat = root / "ssd-stat"
                 block_stat.write_text("0 0 0 0 0 0 0 0 0 0 0\n", encoding="ascii")
                 runtime_read = root / "runtime-read-bytes"
@@ -344,7 +345,9 @@ class DramPrefixCacheTest(unittest.TestCase):
                             "ssd_offload_path": str(ssd_path),
                             "benchmark_ssd_verified": True,
                             "benchmark_ssd_kname": "fake0",
-                            "benchmark_ssd_direct_io": True,
+                            "benchmark_ssd_direct_io": False,
+                            "benchmark_ssd_page_cache_drop": True,
+                            "benchmark_ssd_io_mode": "posix-fadvise-dontneed",
                         }
                     ),
                     encoding="utf-8",
@@ -488,6 +491,7 @@ class DramPrefixCacheTest(unittest.TestCase):
                 root = Path(temp_dir)
                 ssd_path = root / "ssd"
                 ssd_path.mkdir()
+                (ssd_path / "bucket-0").write_bytes(b"fake-ssd-kv")
                 block_stat = root / "ssd-stat"
                 block_stat.write_text("0 0 0 0 0 0 0 0 0 0 0\n", encoding="ascii")
                 runtime_read = root / "runtime-read-bytes"
@@ -502,7 +506,9 @@ class DramPrefixCacheTest(unittest.TestCase):
                             "ssd_offload_path": str(ssd_path),
                             "benchmark_ssd_verified": True,
                             "benchmark_ssd_kname": "fake0",
-                            "benchmark_ssd_direct_io": True,
+                            "benchmark_ssd_direct_io": False,
+                            "benchmark_ssd_page_cache_drop": True,
+                            "benchmark_ssd_io_mode": "posix-fadvise-dontneed",
                         }
                     ),
                     encoding="utf-8",
