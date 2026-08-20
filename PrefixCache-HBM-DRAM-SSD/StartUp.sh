@@ -8,7 +8,7 @@ STARTUP_START_TICKS=""
 if [ -r "/proc/$STARTUP_PID/stat" ]; then
   STARTUP_START_TICKS=$(awk '{print $22}' "/proc/$STARTUP_PID/stat")
 fi
-STARTUP_VERSION="restart-preserve-ssd-v2"
+STARTUP_VERSION="restart-preserve-ssd-v3"
 
 SERVED_NAME="Qwen3-8B"
 MODEL_PATH="/mnt/weight/${SERVED_NAME}"
@@ -17,9 +17,10 @@ MOONCAKE_JSON=/tmp/mooncake.json
 MASTER_PORT=50088
 METRICS_PORT=9003
 SSD_ROOT="${MOONCAKE_SSD_ROOT:-/mnt/mooncake-ssd-offload}"
-# Qwen3-8B 的单条 16K BF16 KV 约 2.25GB；接收线程逐请求读取，默认 4GB
-# 可覆盖单条 R4，同时避免为并发数重复预留 staging buffer。
-SSD_BUFFER_MB="${MOONCAKE_SSD_BUFFER_MB:-4096}"
+# Qwen3-8B 的单条 16K BF16 KV 约 2.25GB。Mooncake FileStorage 还需要
+# 批处理/读写工作区；4GB 在实测中只能持久化约 2.0GB，因此默认留 8GB。
+# load_async=false 时接收线程逐请求读取，无需按并发数线性扩大。
+SSD_BUFFER_MB="${MOONCAKE_SSD_BUFFER_MB:-8192}"
 SSD_QUOTA_GB="${MOONCAKE_SSD_QUOTA_GB:-3072}"
 # A3 未启用 Fabric Memory 时，vLLM-Ascend/Mooncake 官方建议使用 NPU 中转
 # buffer。它会避免把超大的 DRAM 段和 SSD staging buffer 直接映射进 ADXL。
@@ -644,6 +645,7 @@ cat > $MOONCAKE_JSON <<EOF
   "benchmark_ssd_io_mode": "posix-fadvise-dontneed",
   "benchmark_ssd_storage_path": "$SSD_SESSION_PATH",
   "benchmark_ssd_storage_backend": "bucket_storage_backend",
+  "benchmark_ssd_buffer_bytes": $((SSD_BUFFER_MB * 1024 * 1024)),
   "benchmark_ssd_overlay_verified": $SSD_OVERLAY_MODE,
   "benchmark_cleanup_managed": true,
   "benchmark_startup_version": "$STARTUP_VERSION",
