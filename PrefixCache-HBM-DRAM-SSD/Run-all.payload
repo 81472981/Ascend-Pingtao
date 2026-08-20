@@ -577,7 +577,7 @@ def wait_ssd_replicas(ssd_bytes_before, required_bytes):
             stable = None
         now = time.monotonic()
         if now - last_progress >= 10:
-            print(f'  SSD写盘 | 已写入{size_text(added)}，等待完成')
+            print(f'  SSD写盘进度 | 已写入{size_text(added)}，等待完成')
             last_progress = now
         last = current
         time.sleep(0.5)
@@ -1366,7 +1366,7 @@ def print_decision_table(results):
 try:
     for batch in range(1, BATCHES + 1):
         seed = seed_for(batch)
-        print(f'\nC{CONCURRENCY} batch {batch}/{BATCHES}; seed={seed}')
+        print(f'\n===== C{CONCURRENCY}-R1/R2/R3 | Batch {batch}/{BATCHES} | seed={seed} =====')
         pre_r1_reset = reset_local('pre-R1 local reset')
         keys_before = mooncake_keys()
         tier_before_r1 = tier_metrics()
@@ -1379,7 +1379,7 @@ try:
         r1['valid'] = r1['valid'] and r1['identity_valid']
         if not r1['identity_valid']:
             r1['reason'] += '; manifest hash mismatch'
-        print('  R1请求完成 | 等待SSD写盘完成')
+        print('  R1完成 | 等待SSD写盘完成')
         keys_after_r1, dram_bytes_after = wait_mooncake_settle(keys_before)
         if dram_bytes_after is None or dram_bytes_after <= dram_bytes_before:
             raise RuntimeError(
@@ -1389,7 +1389,7 @@ try:
         ssd_bytes_after = wait_ssd_replicas(ssd_bytes_before, batch_dram_bytes)
         batch_ssd_replica_bytes = int(ssd_bytes_after - ssd_bytes_before)
         required_ssd_read_bytes = batch_dram_bytes
-        print(f'  SSD写盘 | 新增{size_text(batch_ssd_replica_bytes)}，完整{size_text(batch_dram_bytes)} | OK')
+        print(f'  SSD写盘完成 | 新增{size_text(batch_ssd_replica_bytes)}，要求{size_text(batch_dram_bytes)} | OK')
         r1['reset_evidence'] += (
             f'; Mooncake stable Keys {keys_before} -> {keys_after_r1}; '
             f'DRAM batch bytes={batch_dram_bytes}; stable SSD allocated bytes '
@@ -1405,11 +1405,14 @@ try:
         batch_contexts.append((batch, seed, entries, required_ssd_read_bytes))
 
     if R3_LEASE_SETTLE_SECONDS:
-        print(f'\nC{CONCURRENCY} SSD切换 | 等待R3读租约释放{R3_LEASE_SETTLE_SECONDS:g}s')
+        print(f'\n===== C{CONCURRENCY}-R4 | 切换准备 =====')
+        print(f'  等待R3读租约释放 | {R3_LEASE_SETTLE_SECONDS:g}s')
         time.sleep(R3_LEASE_SETTLE_SECONDS)
-    print(f'C{CONCURRENCY} SSD切换 | 等待SSD写盘完成')
+    else:
+        print(f'\n===== C{CONCURRENCY}-R4 | 切换准备 =====')
+    print('  等待SSD写盘完成')
     wait_ssd_settle()
-    print(f'C{CONCURRENCY} SSD切换 | 保留SSD，重启并清空HBM/DRAM')
+    print('  保留SSD，重启并清空HBM/DRAM')
     restart_evidence = request_runtime_restart()
     recovered_tier = tier_metrics()
     print(
@@ -1417,7 +1420,7 @@ try:
         f'键={mooncake_keys()}'
     )
     for batch, seed, entries, required_ssd_read_bytes in batch_contexts:
-        print(f'\nC{CONCURRENCY} batch {batch}/{BATCHES}; R4 SSD verification')
+        print(f'\n===== C{CONCURRENCY}-R4 | Batch {batch}/{BATCHES} | SSD验证 =====')
         pre_r4_reset = reset_local('pre-R4 local reset after controlled restart')
         cache_drop_evidence = drop_ssd_page_cache()
         print('  R4清页缓存 | OK')
