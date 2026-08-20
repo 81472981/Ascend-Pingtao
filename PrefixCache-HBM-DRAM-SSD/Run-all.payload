@@ -119,6 +119,7 @@ MIN_HIT_RATE = float(os.environ.get('VB_MIN_HIT_RATE', '0.95'))
 MAX_MISS_RATE = float(os.environ.get('VB_MAX_MISS_RATE', '0.05'))
 STORE_STABLE_SECONDS = float(os.environ.get('VB_STORE_STABLE_SECONDS', '2'))
 STORE_TIMEOUT_SECONDS = float(os.environ.get('VB_STORE_TIMEOUT_SECONDS', '300'))
+R3_LEASE_SETTLE_SECONDS = float(os.environ.get('VB_R3_LEASE_SETTLE_SECONDS', '12'))
 RUNTIME_RESTART_TIMEOUT_SECONDS = float(os.environ.get('VB_RUNTIME_RESTART_TIMEOUT_SECONDS', '1800'))
 STRICT = os.environ.get('VB_STRICT', '1').lower() not in ('0', 'false', 'no')
 NEW_SESSION = os.environ.get('VB_NEW_SESSION', '0').lower() in ('1', 'true', 'yes')
@@ -160,6 +161,8 @@ if INPUT_LEN <= 0 or BLOCK_SIZE <= 0 or INPUT_LEN % BLOCK_SIZE:
     sys.exit('VB_INPUT_LEN must be positive and divisible by VB_BLOCK_SIZE')
 if RUNTIME_RESTART_TIMEOUT_SECONDS <= 0:
     sys.exit('VB_RUNTIME_RESTART_TIMEOUT_SECONDS must be positive')
+if R3_LEASE_SETTLE_SECONDS < 0:
+    sys.exit('VB_R3_LEASE_SETTLE_SECONDS must be non-negative')
 REQUIRED_SOURCE_HIT_RATE = max(MIN_HIT_RATE, (INPUT_LEN - BLOCK_SIZE) / INPUT_LEN - 1e-9)
 CACHE_PAIRS = {'local': (('vllm:prefix_cache_queries_total', 'vllm:prefix_cache_hits_total'), ('vllm:prefix_cache_queries', 'vllm:prefix_cache_hits')), 'external': (('vllm:external_prefix_cache_queries_total', 'vllm:external_prefix_cache_hits_total'), ('vllm:external_prefix_cache_queries', 'vllm:external_prefix_cache_hits'))}
 TIER_METRIC_NAMES = {
@@ -392,10 +395,7 @@ def request_runtime_restart():
         cache = cache_metrics()
         recovered = (
             ssd is not None and ssd >= old_ssd
-            # Before restart, Keys includes DRAM-only objects.  After the
-            # required DRAM reset it can legitimately decrease to the SSD
-            # object count, so only require readable, non-empty SSD metadata.
-            and keys is not None and keys > 0
+            and keys is not None and keys >= old_keys
             and dram in (None, 0)
             and cache.get('local') is not None and cache.get('external') is not None
             and runtime_read_bytes() is not None
@@ -404,7 +404,7 @@ def request_runtime_restart():
         if recovered and snapshot == last:
             stable = stable or time.monotonic()
             if time.monotonic() - stable >= STORE_STABLE_SECONDS:
-                return f'restart {gen}->{next_gen}; DRAM=0; SSD={ssd:g}>={old_ssd:g}; Keys={old_keys}->{keys}'
+                return f'restart {gen}->{next_gen}; DRAM=0; SSD={ssd:g}>={old_ssd:g}; Keys={keys}>={old_keys}'
         else:
             stable = None
         last = snapshot
@@ -572,6 +572,13 @@ def wait_ssd_replicas(ssd_bytes_before):
         time.sleep(0.5)
     added = max(0, (last or 0) - ssd_bytes_before)
     raise RuntimeError(f'SSD did not create a stable new replica: added={added}')
+
+def wait_ssd_settle():
+    return wait_stable(
+        lambda: tier_metrics().get('ssd_allocated_bytes'),
+        lambda value: value is not None and value > 0,
+        'SSD write completion',
+    )
 
 def completion_prompt(body):
     try:
@@ -1270,7 +1277,12 @@ try:
             record_result(result, entries)
         batch_contexts.append((batch, seed, entries, required_ssd_read_bytes))
 
-    print(f'\nC{CONCURRENCY} SSD切换 | 保留SSD，重启并清空HBM/DRAM')
+    if R3_LEASE_SETTLE_SECONDS:
+        print(f'\nC{CONCURRENCY} SSD切换 | 等待R3读租约释放{R3_LEASE_SETTLE_SECONDS:g}s')
+        time.sleep(R3_LEASE_SETTLE_SECONDS)
+    print(f'C{CONCURRENCY} SSD切换 | 等待SSD写盘完成')
+    wait_ssd_settle()
+    print(f'C{CONCURRENCY} SSD切换 | 保留SSD，重启并清空HBM/DRAM')
     restart_evidence = request_runtime_restart()
     recovered_tier = tier_metrics()
     print(

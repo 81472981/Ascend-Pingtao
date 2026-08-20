@@ -600,6 +600,8 @@ export MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=$((SSD_BUFFER_MB * 1024 * 1024))
 export MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE=$((SSD_QUOTA_GB * 1024 * 1024 * 1024))
 export MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=$((SSD_QUOTA_GB * 1024 * 1024 * 1024))
 export MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY=none
+# R3 后的短暂租约释放后尽快继续后台 SSD offload，避免受默认 10 秒 heartbeat 延迟。
+export MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1
 # 当前 Ascend 驱动在 io_uring_register_buffers(aclrtMallocHost buffer) 返回 EFAULT
 # 后会进入 507899 错误状态，Mooncake 的 fallback 无法恢复。因此显式使用稳定的
 # POSIX pread/pwrite 路径。Run-all 在每次 R4 前 fsync + POSIX_FADV_DONTNEED，并要求
