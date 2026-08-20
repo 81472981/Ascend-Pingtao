@@ -1349,18 +1349,19 @@ def metric_text(value):
     return f'{value:.4f}' if value is not None else '-'
 
 def print_decision_table(results):
-    print('\n+-------+---------------+----------+---------------+----------------+-----------------+-------+----------------------------------------------------------+')
-    print('| Stage | Tier          | TTFT(s)  | HBM lookup(s) | DRAM lookup(s) | DRAM move(s)    | Valid | Evidence                                                 |')
-    print('+-------+---------------+----------+---------------+----------------+-----------------+-------+----------------------------------------------------------+')
+    print('\n+-------+-------+---------+--------+---------+---------+-------+--------------------------------------+')
+    print('| Stage | Tier  | TTFT(s) | HBM(s) | DRAM(s) | Move(s) | Valid | Evidence                             |')
+    print('+-------+-------+---------+--------+---------+---------+-------+--------------------------------------+')
     for result in results:
         ttft = metric_text(result_ttft(result))
         hbm_lookup = metric_text(result_trace_average(result, 'hbm_lookup_seconds'))
         dram_lookup = metric_text(result_trace_average(result, 'dram_lookup_seconds'))
         dram_move = metric_text(result_trace_average(result, 'dram_to_hbm_seconds'))
         valid = f'{"OK" if result["valid"] else "X"} {result["completed"]}/{CONCURRENCY}'
-        evidence = f'{result["stage"].split("-", 1)[0]} {result["source"]}; {result_evidence(result)}'[:56]
-        print(f'| {result["stage"].split("-", 1)[0]:<5} | {result["source"]:<13} | {ttft:>8} | {hbm_lookup:>13} | {dram_lookup:>14} | {dram_move:>15} | {valid:<5} | {evidence:<56} |')
-    print('+-------+---------------+----------+---------------+----------------+-----------------+-------+----------------------------------------------------------+')
+        tier = result['source'] if len(result['source']) <= 5 else 'MIXED'
+        evidence = f'{result["stage"].split("-", 1)[0]} {result["source"]}; {result_evidence(result)}'[:36]
+        print(f'| {result["stage"].split("-", 1)[0]:<5} | {tier:<5} | {ttft:>7} | {hbm_lookup:>6} | {dram_lookup:>7} | {dram_move:>7} | {valid:<5} | {evidence:<36} |')
+    print('+-------+-------+---------+--------+---------+---------+-------+--------------------------------------+')
 
 try:
     for batch in range(1, BATCHES + 1):
