@@ -8,7 +8,7 @@ STARTUP_START_TICKS=""
 if [ -r "/proc/$STARTUP_PID/stat" ]; then
   STARTUP_START_TICKS=$(awk '{print $22}' "/proc/$STARTUP_PID/stat")
 fi
-STARTUP_VERSION="restart-preserve-ssd-v1"
+STARTUP_VERSION="restart-preserve-ssd-v2"
 
 SERVED_NAME="Qwen3-8B"
 MODEL_PATH="/mnt/weight/${SERVED_NAME}"
@@ -473,6 +473,10 @@ export OMP_NUM_THREADS=10
 # Enable the benchmark-only /reset_prefix_cache endpoint. Run-all uses it with
 # reset_connector=false, so only HBM is cleared and Mooncake DRAM is retained.
 export VLLM_SERVER_DEV_MODE=1
+KV_TRACE_FILE="${VB_KV_TRACE_FILE:-/tmp/vb-kv-timing-$STARTUP_PID.jsonl}"
+export VB_KV_TRACE_FILE="$KV_TRACE_FILE"
+: > "$KV_TRACE_FILE"
+echo "R3 TTFT 埋点 trace：$KV_TRACE_FILE"
 unset ASCEND_ENABLE_USE_FABRIC_MEM
 # 当前容器沿用加入 SSD 前的非 Fabric 路径。开启官方推荐的 4×8MB NPU
 # 中转池后，Mooncake 日志应出现 "Set adxl.BufferPool to:4:8"，并对 Host
@@ -597,9 +601,18 @@ export PYTHONPATH="$VLLM_PATCH_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
 # Mooncake SSD offload：每次启动使用新的空目录，避免上次会话的数据污染冷启动。
 export MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=$((SSD_BUFFER_MB * 1024 * 1024))
+# ``ssd_offload_path`` in mooncake.json is consumed by the embedded client, but
+# the FileStorage backend itself reads this canonical environment variable.
+# Set both explicitly: restart recovery must scan this exact session directory,
+# never Mooncake's default /data/file_storage.
+export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH="$SSD_SESSION_PATH"
+export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 export MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE=$((SSD_QUOTA_GB * 1024 * 1024 * 1024))
 export MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=$((SSD_QUOTA_GB * 1024 * 1024 * 1024))
 export MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY=none
+# The benchmark owns this session and deletes it at exit.  Disable background
+# watermark eviction so a freshly persisted P1 cannot disappear before R4.
+export MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION=false
 # R3 后的短暂租约释放后尽快继续后台 SSD offload，避免受默认 10 秒 heartbeat 延迟。
 export MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1
 # 当前 Ascend 驱动在 io_uring_register_buffers(aclrtMallocHost buffer) 返回 EFAULT
@@ -629,6 +642,8 @@ cat > $MOONCAKE_JSON <<EOF
   "benchmark_ssd_direct_io": false,
   "benchmark_ssd_page_cache_drop": true,
   "benchmark_ssd_io_mode": "posix-fadvise-dontneed",
+  "benchmark_ssd_storage_path": "$SSD_SESSION_PATH",
+  "benchmark_ssd_storage_backend": "bucket_storage_backend",
   "benchmark_ssd_overlay_verified": $SSD_OVERLAY_MODE,
   "benchmark_cleanup_managed": true,
   "benchmark_startup_version": "$STARTUP_VERSION",
@@ -636,7 +651,8 @@ cat > $MOONCAKE_JSON <<EOF
   "benchmark_startup_start_ticks": "$STARTUP_START_TICKS",
   "benchmark_runtime_control": "signal-request-v1",
   "benchmark_runtime_request_path": "$RUNTIME_REQUEST_PATH",
-  "benchmark_runtime_status_path": "$RUNTIME_STATUS_PATH"
+  "benchmark_runtime_status_path": "$RUNTIME_STATUS_PATH",
+  "benchmark_kv_trace_file": "$KV_TRACE_FILE"
 }
 EOF
 cat $MOONCAKE_JSON

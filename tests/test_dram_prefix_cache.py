@@ -226,11 +226,10 @@ class DramHandler(http.server.BaseHTTPRequestHandler):
                 if "-r1-" in request_id:
                     self.state.keys += 1
                     self.state.dram_allocated_bytes += 8192
-                    # Later P1s can share SSD-resident KV blocks from an
-                    # earlier P1, so their new allocation can be smaller.
+                    # Every generated P1 is unique, therefore an R1 DRAM
+                    # batch must have a complete equal-sized SSD replica.
                     self.state.r1_write_count += 1
-                    blocks = 126 if self.state.r1_write_count == 1 else 110
-                    self.state.ssd_allocated_bytes += 8192 * blocks // 128
+                    self.state.ssd_allocated_bytes += 8192
                 elif "-r2-" in request_id:
                     self.state.local_hits += cacheable_tokens
                     self.state.external_hits += cacheable_tokens
@@ -461,6 +460,9 @@ class DramPrefixCacheTest(unittest.TestCase):
                             "enable_ssd_offload": True,
                             "ssd_offload_path": str(ssd_path),
                             "benchmark_ssd_verified": True,
+                            "benchmark_startup_version": "restart-preserve-ssd-v2",
+                            "benchmark_ssd_storage_path": str(ssd_path),
+                            "benchmark_ssd_storage_backend": "bucket_storage_backend",
                             "benchmark_ssd_kname": "fake0",
                             "benchmark_ssd_direct_io": False,
                             "benchmark_ssd_page_cache_drop": True,
@@ -644,6 +646,9 @@ class DramPrefixCacheTest(unittest.TestCase):
                             "enable_ssd_offload": True,
                             "ssd_offload_path": str(ssd_path),
                             "benchmark_ssd_verified": True,
+                            "benchmark_startup_version": "restart-preserve-ssd-v2",
+                            "benchmark_ssd_storage_path": str(ssd_path),
+                            "benchmark_ssd_storage_backend": "bucket_storage_backend",
                             "benchmark_ssd_kname": "fake0",
                             "benchmark_ssd_direct_io": False,
                             "benchmark_ssd_page_cache_drop": True,

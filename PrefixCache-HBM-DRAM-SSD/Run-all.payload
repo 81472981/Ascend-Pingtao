@@ -153,6 +153,7 @@ ROOT_PID = None
 START_TICKS = None
 REQUEST_PATH = None
 STATUS_PATH = None
+KV_TRACE_PATH = None
 RUNTIME_READ_BYTES_OVERRIDE = Path(os.environ['VB_RUNTIME_READ_BYTES_PATH']) if os.environ.get('VB_RUNTIME_READ_BYTES_PATH') else None
 STAGES = ('R1-warmup', 'R2-hbm-cache', 'R3-dram-cache', 'R4-ssd-cache')
 if CONCURRENCY <= 0 or BATCHES <= 0:
@@ -551,13 +552,23 @@ def wait_mooncake_settle(keys_before):
     read_value = lambda: (mooncake_keys(), tier_metrics().get('dram_allocated_bytes'))
     return wait_stable(read_value, lambda value: value[0] is not None and value[0] > (keys_before or 0) and value[1] is not None, 'Mooncake DRAM')
 
-def wait_ssd_replicas(ssd_bytes_before):
+def wait_ssd_replicas(ssd_bytes_before, required_bytes):
+    """Wait for a *complete* R1 DRAM batch to be replicated to SSD.
+
+    A non-zero SSD delta only proves that a subset of KV objects reached disk.
+    It is not sufficient for R4: external lookup stops at the first absent
+    block.  The single-rank benchmark stores equal-sized DRAM and SSD objects,
+    so require the whole measured DRAM delta before continuing.
+    """
+    if required_bytes <= 0:
+        raise RuntimeError(f'invalid required SSD replica size: {required_bytes}')
     deadline = time.monotonic() + STORE_TIMEOUT_SECONDS
     last = stable = None
     last_progress = time.monotonic()
     while time.monotonic() < deadline:
         current = tier_metrics().get('ssd_allocated_bytes')
-        if current is not None and current > ssd_bytes_before and current == last:
+        added = max(0, (current or 0) - ssd_bytes_before)
+        if current is not None and added >= required_bytes and current == last:
             stable = stable or time.monotonic()
             if time.monotonic() - stable >= STORE_STABLE_SECONDS:
                 return current
@@ -565,13 +576,15 @@ def wait_ssd_replicas(ssd_bytes_before):
             stable = None
         now = time.monotonic()
         if now - last_progress >= 10:
-            added = max(0, (current or 0) - ssd_bytes_before)
             print(f'  SSD写盘 | 已写入{size_text(added)}，等待完成')
             last_progress = now
         last = current
         time.sleep(0.5)
     added = max(0, (last or 0) - ssd_bytes_before)
-    raise RuntimeError(f'SSD did not create a stable new replica: added={added}')
+    raise RuntimeError(
+        f'SSD replica incomplete: wrote={size_text(added)}, required={size_text(required_bytes)}; '
+        'refusing R4 because an incomplete prefix cannot prove SSD retrieval'
+    )
 
 def wait_ssd_settle():
     return wait_stable(
@@ -848,6 +861,54 @@ def result_arrays(data):
     completed = sum((1 for index in range(CONCURRENCY) if index < len(ttfts) and ttfts[index] is not None and (not (errors[index] if index < len(errors) else None))))
     return (completed, CONCURRENCY - completed)
 
+def kv_trace_offset():
+    if KV_TRACE_PATH is None:
+        return None
+    try:
+        return KV_TRACE_PATH.stat().st_size
+    except FileNotFoundError:
+        return 0
+
+def r3_trace_since(offset):
+    if KV_TRACE_PATH is None or offset is None:
+        return {}
+    try:
+        with KV_TRACE_PATH.open('rb') as trace_file:
+            trace_file.seek(offset)
+            payload = trace_file.read().decode('utf-8')
+    except FileNotFoundError:
+        return {}
+    except OSError as error:
+        raise RuntimeError(f'cannot read R3 KV trace {KV_TRACE_PATH}: {error}') from error
+    traces = {}
+    for line in payload.splitlines():
+        try:
+            record = json.loads(line)
+            request_id = record['request_id']
+            elapsed_seconds = float(record['elapsed_ms']) / 1000
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise RuntimeError(f'invalid R3 KV trace record: {line!r}') from error
+        item = traces.setdefault(request_id, {})
+        if record.get('event') == 'dram_lookup':
+            item['dram_lookup_seconds'] = item.get('dram_lookup_seconds', 0) + elapsed_seconds
+            item['hit_tokens'] = record.get('hit_tokens')
+        elif record.get('event') == 'dram_to_hbm_load':
+            item['dram_to_hbm_seconds'] = item.get('dram_to_hbm_seconds', 0) + elapsed_seconds
+            item['dram_to_hbm_success'] = bool(record.get('success'))
+            item['key_count'] = record.get('key_count')
+    return traces
+
+def r3_trace_status(trace):
+    if trace is None:
+        return 'missing_trace' if KV_TRACE_PATH is not None else 'not_configured'
+    if 'dram_lookup_seconds' not in trace:
+        return 'missing_lookup'
+    if 'dram_to_hbm_seconds' not in trace:
+        return 'missing_load'
+    if not trace.get('dram_to_hbm_success'):
+        return 'load_failed'
+    return 'complete'
+
 def run_stage(vllm, stage, batch, seed, expected_entries, reset_evidence='', restart_verified=False, required_ssd_read_bytes=0):
     stage_slug = stage.split('-', 1)[0].lower()
     request_prefix = f'p1-c{CONCURRENCY}-b{batch}-{stage_slug}-'
@@ -859,6 +920,7 @@ def run_stage(vllm, stage, batch, seed, expected_entries, reset_evidence='', res
     tier_before = tier_metrics()
     runtime_reads_before = runtime_read_bytes()
     device_reads_before = ssd_device_read_bytes()
+    trace_offset = kv_trace_offset() if stage == 'R3-dram-cache' else None
     run_command(benchmark_command(vllm, stage, batch, seed, filename, request_prefix))
     after = cache_metrics()
     tier_after = tier_metrics()
@@ -866,6 +928,7 @@ def run_stage(vllm, stage, batch, seed, expected_entries, reset_evidence='', res
     device_reads_after = ssd_device_read_bytes()
     data = json.loads(output_path.read_text(encoding='utf-8'))
     captures = captured_prompts(request_prefix, CONCURRENCY)
+    r3_traces = r3_trace_since(trace_offset) if stage == 'R3-dram-cache' else {}
     delta = cache_delta(before, after)
     storage_delta = tier_delta(tier_before, tier_after)
     storage_delta.update({
@@ -904,7 +967,8 @@ def run_stage(vllm, stage, batch, seed, expected_entries, reset_evidence='', res
     if not identity_valid:
         reason_parts.append('prompt hashes do not match the fixed batch P1')
     source = source_name(stage, delta, storage_delta)
-    return {'stage': stage, 'batch': batch, 'seed': seed, 'filename': filename, 'data': data, 'captures': captures, 'hashes': hashes, 'delta': delta, 'storage_delta': storage_delta, 'completed': completed, 'failed': failed, 'input_valid': input_valid, 'identity_valid': identity_valid, 'source': source, 'valid': valid, 'reason': '; '.join(reason_parts), 'reset_evidence': reset_evidence}
+    trace_statuses = [r3_trace_status(r3_traces.get(capture['request_id'])) for capture in captures] if stage == 'R3-dram-cache' else []
+    return {'stage': stage, 'batch': batch, 'seed': seed, 'filename': filename, 'data': data, 'captures': captures, 'hashes': hashes, 'delta': delta, 'storage_delta': storage_delta, 'completed': completed, 'failed': failed, 'input_valid': input_valid, 'identity_valid': identity_valid, 'source': source, 'valid': valid, 'reason': '; '.join(reason_parts), 'reset_evidence': reset_evidence, 'r3_traces': r3_traces, 'r3_trace_statuses': trace_statuses}
 
 def raw_rows_for(stage_result, entries):
     data = stage_result['data']
@@ -915,10 +979,14 @@ def raw_rows_for(stage_result, entries):
     generated = data.get('generated_texts') or []
     rows = []
     for index, entry in enumerate(entries):
+        capture = stage_result['captures'][index] if index < len(stage_result['captures']) else {}
+        request_id = capture.get('request_id', '')
+        trace = stage_result['r3_traces'].get(request_id) if stage_result['stage'] == 'R3-dram-cache' else None
+        trace_status = r3_trace_status(trace) if stage_result['stage'] == 'R3-dram-cache' else ''
         error = errors[index] if index < len(errors) else 'missing result'
         ttft = ttfts[index] if index < len(ttfts) else None
         request_valid = stage_result['valid'] and ttft is not None and (not error)
-        rows.append([stage_result['stage'], CONCURRENCY, stage_result['batch'], entry['prompt_id'], index + 1, stage_result['seed'], float(ttft) if ttft is not None else '', input_lens[index] if index < len(input_lens) else '', output_lens[index] if index < len(output_lens) else '', entry['prompt_sha256'], entry['token_sha256'], entry['first_block_sha256'], generated[index] if index < len(generated) else '', stage_result['source'], 'yes' if request_valid else 'no', error or '', stage_result['filename']])
+        rows.append([stage_result['stage'], CONCURRENCY, stage_result['batch'], entry['prompt_id'], index + 1, stage_result['seed'], float(ttft) if ttft is not None else '', input_lens[index] if index < len(input_lens) else '', output_lens[index] if index < len(output_lens) else '', entry['prompt_sha256'], entry['token_sha256'], entry['first_block_sha256'], generated[index] if index < len(generated) else '', stage_result['source'], 'yes' if request_valid else 'no', error or '', stage_result['filename'], request_id, trace.get('dram_lookup_seconds', '') if trace else '', trace.get('dram_to_hbm_seconds', '') if trace else '', trace.get('dram_to_hbm_success', '') if trace else '', trace_status])
     return rows
 
 def validation_row(stage_result):
@@ -935,10 +1003,12 @@ def validation_row(stage_result):
         tier_value('ssd_allocated_before'), tier_value('ssd_allocated_after'),
         tier_value('runtime_read_bytes'), tier_value('ssd_device_read_bytes'), stage_result['source'],
         'yes' if stage_result['valid'] else 'no', stage_result['reason'], stage_result['reset_evidence'],
-        tier_value('required_ssd_read_bytes'),
+        tier_value('required_ssd_read_bytes'), len(stage_result['r3_trace_statuses']),
+        sum(status == 'complete' for status in stage_result['r3_trace_statuses']),
+        ','.join(sorted(set(stage_result['r3_trace_statuses']))) if stage_result['r3_trace_statuses'] else '',
     ]
-RAW_HEADER = ['stage', 'concurrency', 'batch', 'prompt_id', 'request_index', 'seed', 'ttft_seconds', 'input_tokens', 'output_tokens', 'prompt_sha256', 'token_sha256', 'first_block_sha256', 'output_text', 'source', 'valid_request', 'error', 'result_file']
-VALIDATION_HEADER = ['concurrency', 'batch', 'stage', 'completed', 'failed', 'prompt_identity_valid', 'input_length_valid', 'local_queries', 'local_hits', 'local_rate', 'external_queries', 'external_hits', 'external_rate', 'dram_allocated_before', 'dram_allocated_after', 'ssd_allocated_before', 'ssd_allocated_after', 'runtime_read_bytes', 'ssd_device_read_bytes', 'source', 'valid_batch', 'reason', 'reset_evidence', 'required_ssd_read_bytes']
+RAW_HEADER = ['stage', 'concurrency', 'batch', 'prompt_id', 'request_index', 'seed', 'ttft_seconds', 'input_tokens', 'output_tokens', 'prompt_sha256', 'token_sha256', 'first_block_sha256', 'output_text', 'source', 'valid_request', 'error', 'result_file', 'request_id', 'dram_lookup_seconds', 'dram_to_hbm_seconds', 'dram_to_hbm_success', 'r3_trace_status']
+VALIDATION_HEADER = ['concurrency', 'batch', 'stage', 'completed', 'failed', 'prompt_identity_valid', 'input_length_valid', 'local_queries', 'local_hits', 'local_rate', 'external_queries', 'external_hits', 'external_rate', 'dram_allocated_before', 'dram_allocated_after', 'ssd_allocated_before', 'ssd_allocated_after', 'runtime_read_bytes', 'ssd_device_read_bytes', 'source', 'valid_batch', 'reason', 'reset_evidence', 'required_ssd_read_bytes', 'r3_trace_requests', 'r3_trace_complete', 'r3_trace_statuses']
 
 def col_name(index):
     name = ''
@@ -1040,7 +1110,7 @@ def completed_payloads():
 
 def rebuild_workbook():
     payloads = completed_payloads()
-    summary = [['Concurrency', 'R1-Warmup-TTFT(s)', 'R2-HBM-TTFT(s)', 'R3-DRAM-TTFT(s)', 'R4-SSD-TTFT(s)', 'R3/R2-Degradation(s)', 'R3/R2-Degradation(%)', 'R4/R2-Degradation(s)', 'R4/R2-Degradation(%)', 'R4/R3-Degradation(s)', 'R4/R3-Degradation(%)', 'Success/All']]
+    summary = [['Concurrency', 'R1-Warmup-TTFT(s)', 'R2-HBM-TTFT(s)', 'R3-DRAM-TTFT(s)', 'R3-DRAM-Lookup(s)', 'R3-DRAM-to-HBM(s)', 'R4-SSD-TTFT(s)', 'R3/R2-Degradation(s)', 'R3/R2-Degradation(%)', 'R4/R2-Degradation(s)', 'R4/R2-Degradation(%)', 'R4/R3-Degradation(s)', 'R4/R3-Degradation(%)', 'Success/All']]
     stage_sheets = {stage: [RAW_HEADER] for stage in STAGES}
     validation = [VALIDATION_HEADER]
     for concurrency, payload in payloads.items():
@@ -1055,13 +1125,15 @@ def rebuild_workbook():
         r1 = values['R1-warmup']['avg_ttft_seconds']
         r2 = values['R2-hbm-cache']['avg_ttft_seconds']
         r3 = values['R3-dram-cache']['avg_ttft_seconds']
+        r3_lookup = values['R3-dram-cache']['avg_dram_lookup_seconds']
+        r3_load = values['R3-dram-cache']['avg_dram_to_hbm_seconds']
         r4 = values['R4-ssd-cache']['avg_ttft_seconds']
         successful = sum(values[stage]['successful_requests'] for stage in STAGES)
         total = sum(values[stage]['total_requests'] for stage in STAGES)
         r3_r2 = r3 - r2 if r2 is not None and r3 is not None else ''
         r4_r2 = r4 - r2 if r2 is not None and r4 is not None else ''
         r4_r3 = r4 - r3 if r3 is not None and r4 is not None else ''
-        summary.append([f'C{concurrency}', r1 if r1 is not None else '', r2 if r2 is not None else '', r3 if r3 is not None else '', r4 if r4 is not None else '', r3_r2, percent_change(r3, r2), r4_r2, percent_change(r4, r2), r4_r3, percent_change(r4, r3), f'{successful}/{total}'])
+        summary.append([f'C{concurrency}', r1 if r1 is not None else '', r2 if r2 is not None else '', r3 if r3 is not None else '', r3_lookup if r3_lookup is not None else '', r3_load if r3_load is not None else '', r4 if r4 is not None else '', r3_r2, percent_change(r3, r2), r4_r2, percent_change(r4, r2), r4_r3, percent_change(r4, r3), f'{successful}/{total}'])
     sheets = {'Summary': summary, **stage_sheets}
     sheets['validation'] = validation
     sheets['P1-manifest'] = manifest_rows
@@ -1072,9 +1144,11 @@ def build_payload(stage_rows, validation_rows):
     stage_summary = {}
     for stage in STAGES:
         values = [float(row[6]) for row in stage_rows[stage] if row[14] == 'yes' and row[6] != '']
+        lookup_values = [float(row[18]) for row in stage_rows[stage] if row[14] == 'yes' and row[18] != '' and row[21] == 'complete']
+        load_values = [float(row[19]) for row in stage_rows[stage] if row[14] == 'yes' and row[19] != '' and row[21] == 'complete']
         total = CONCURRENCY * BATCHES
         successful = sum((1 for row in stage_rows[stage] if row[6] != '' and (not row[15])))
-        item = {'successful_requests': successful, 'total_requests': total, 'success_rate_percent': successful / total * 100 if total else 0, 'ttft_samples': len(values), 'avg_ttft_seconds': statistics.fmean(values) if values else None, 'min_ttft_seconds': min(values) if values else None, 'max_ttft_seconds': max(values) if values else None}
+        item = {'successful_requests': successful, 'total_requests': total, 'success_rate_percent': successful / total * 100 if total else 0, 'ttft_samples': len(values), 'avg_ttft_seconds': statistics.fmean(values) if values else None, 'min_ttft_seconds': min(values) if values else None, 'max_ttft_seconds': max(values) if values else None, 'dram_lookup_samples': len(lookup_values), 'avg_dram_lookup_seconds': statistics.fmean(lookup_values) if lookup_values else None, 'dram_to_hbm_samples': len(load_values), 'avg_dram_to_hbm_seconds': statistics.fmean(load_values) if load_values else None}
         stage_summary[stage] = item
         summary_rows.append([stage, CONCURRENCY, item['successful_requests'], item['total_requests'], item['success_rate_percent'], item['ttft_samples'], item['avg_ttft_seconds'] if item['avg_ttft_seconds'] is not None else '', item['min_ttft_seconds'] if item['min_ttft_seconds'] is not None else '', item['max_ttft_seconds'] if item['max_ttft_seconds'] is not None else ''])
     return {'created_at': now_cn(), 'concurrency': CONCURRENCY, 'batches': BATCHES, 'input_tokens': INPUT_LEN, 'block_size': BLOCK_SIZE, 'stage_rows': stage_rows, 'validation_rows': validation_rows, 'summary_rows': summary_rows, 'stage_summary': stage_summary}
@@ -1122,6 +1196,7 @@ def prepare_session():
         'ssd_kname': storage_config.get('benchmark_ssd_kname'),
         'ssd_io_mode': storage_config.get('benchmark_ssd_io_mode'),
         'ssd_page_cache_drop': storage_config.get('benchmark_ssd_page_cache_drop'),
+        'kv_trace_file': str(KV_TRACE_PATH) if KV_TRACE_PATH is not None else None,
         'mooncake_config_sha256': hashlib.sha256(config_bytes).hexdigest(),
         'ssd_transition': {
             'mode': storage_config.get('benchmark_runtime_control'),
@@ -1134,19 +1209,28 @@ def prepare_session():
     return session
 
 def verify_preconditions():
-    global SSD_BLOCK_STAT, SSD_OFFLOAD_PATH, ROOT_PID, START_TICKS, REQUEST_PATH, STATUS_PATH
+    global SSD_BLOCK_STAT, SSD_OFFLOAD_PATH, ROOT_PID, START_TICKS, REQUEST_PATH, STATUS_PATH, KV_TRACE_PATH
     metrics = cache_metrics()
     if metrics['local'] is None or metrics['external'] is None:
         sys.exit('local/external prefix-cache counters are unavailable on /metrics')
     if not MOONCAKE_CONFIG.is_file():
         sys.exit(f'Mooncake config not found: {MOONCAKE_CONFIG}')
     config = json.loads(MOONCAKE_CONFIG.read_text(encoding='utf-8'))
+    trace_path = os.environ.get('VB_KV_TRACE_FILE') or config.get('benchmark_kv_trace_file')
+    if trace_path:
+        KV_TRACE_PATH = Path(trace_path)
     if not config.get('enable_ssd_offload'):
         sys.exit('SSD offload is disabled; run the SSD-enabled StartUp.sh before Run-all')
     if not config.get('benchmark_ssd_verified'):
         sys.exit('SSD path was not verified as a non-rotating block device by StartUp.sh')
     if not config.get('benchmark_ssd_page_cache_drop'):
         sys.exit('StartUp.sh did not enable the required per-R4 SSD page-cache drop')
+    if config.get('benchmark_startup_version') != 'restart-preserve-ssd-v2':
+        sys.exit('启动代码未启用完整SSD副本校验；请重新复制执行最新版StartUp.sh内容')
+    if config.get('benchmark_ssd_storage_path') != config.get('ssd_offload_path'):
+        sys.exit('StartUp.sh did not bind Mooncake FileStorage to this SSD session')
+    if config.get('benchmark_ssd_storage_backend') != 'bucket_storage_backend':
+        sys.exit('StartUp.sh did not select the recoverable Mooncake bucket SSD backend')
     if config.get('benchmark_ssd_io_mode') != 'posix-fadvise-dontneed':
         sys.exit(f'unsupported SSD I/O validation mode: {config.get("benchmark_ssd_io_mode")!r}')
     ssd_kname = config.get('benchmark_ssd_kname')
@@ -1260,10 +1344,10 @@ try:
                 f'R1 did not create a measurable DRAM copy: {dram_bytes_before} -> {dram_bytes_after}'
             )
         batch_dram_bytes = int(dram_bytes_after - dram_bytes_before)
-        ssd_bytes_after = wait_ssd_replicas(ssd_bytes_before)
+        ssd_bytes_after = wait_ssd_replicas(ssd_bytes_before, batch_dram_bytes)
         batch_ssd_replica_bytes = int(ssd_bytes_after - ssd_bytes_before)
-        required_ssd_read_bytes = batch_ssd_replica_bytes
-        print(f'  SSD写盘 | 新增{size_text(batch_ssd_replica_bytes)} | OK')
+        required_ssd_read_bytes = batch_dram_bytes
+        print(f'  SSD写盘 | 新增{size_text(batch_ssd_replica_bytes)}，完整{size_text(batch_dram_bytes)} | OK')
         r1['reset_evidence'] += (
             f'; Mooncake stable Keys {keys_before} -> {keys_after_r1}; '
             f'DRAM batch bytes={batch_dram_bytes}; stable SSD allocated bytes '
