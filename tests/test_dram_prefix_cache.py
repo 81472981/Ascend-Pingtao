@@ -110,6 +110,7 @@ class FakeState:
         self.dram_allocated_bytes = 0
         self.ssd_allocated_bytes = 0
         self.r1_write_count = 0
+        self.restart_key_drop = 0
         self.valid_gets = 0
         self.r4_tier = "ssd"
         self.block_stat_path: Path | None = None
@@ -207,6 +208,7 @@ class DramHandler(http.server.BaseHTTPRequestHandler):
         if path == "/test/restart":
             with self.state.lock:
                 self.state.dram_allocated_bytes = 0
+                self.state.keys = max(1, self.state.keys - self.state.restart_key_drop)
             self.send_bytes(b"true", "text/plain")
             return
         if path == "/tokenize":
@@ -432,6 +434,7 @@ class DramPrefixCacheTest(unittest.TestCase):
 
     def test_run_all_validates_hbm_dram_and_ssd_in_one_session(self) -> None:
         state = FakeState()
+        state.restart_key_drop = 1
         DramHandler.state = state
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), DramHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)

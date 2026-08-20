@@ -392,7 +392,10 @@ def request_runtime_restart():
         cache = cache_metrics()
         recovered = (
             ssd is not None and ssd >= old_ssd
-            and keys is not None and keys >= old_keys
+            # Before restart, Keys includes DRAM-only objects.  After the
+            # required DRAM reset it can legitimately decrease to the SSD
+            # object count, so only require readable, non-empty SSD metadata.
+            and keys is not None and keys > 0
             and dram in (None, 0)
             and cache.get('local') is not None and cache.get('external') is not None
             and runtime_read_bytes() is not None
@@ -401,7 +404,7 @@ def request_runtime_restart():
         if recovered and snapshot == last:
             stable = stable or time.monotonic()
             if time.monotonic() - stable >= STORE_STABLE_SECONDS:
-                return f'restart {gen}->{next_gen}; DRAM=0; SSD={ssd:g}>={old_ssd:g}; Keys={keys}>={old_keys}'
+                return f'restart {gen}->{next_gen}; DRAM=0; SSD={ssd:g}>={old_ssd:g}; Keys={old_keys}->{keys}'
         else:
             stable = None
         last = snapshot
