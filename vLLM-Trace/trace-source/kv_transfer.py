@@ -927,13 +927,6 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         # m_store.get() does not return until this request's KV load has
         # completed; this deliberately measures completion, not enqueue time.
         # ================================================================
-        if "-r4-" in req_id:  # pingtao add
-            _write_kv_ttft_trace(  # pingtao add
-                "r4_load_keys",  # pingtao add
-                req_id,  # pingtao add
-                elapsed_ms=0,  # pingtao add
-                keys=key_list_c,  # pingtao add
-            )  # pingtao add
         load_start_ns = time.perf_counter_ns()  # pingtao add
         ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
         load_ms = (time.perf_counter_ns() - load_start_ns) / 1_000_000  # pingtao add
@@ -941,6 +934,14 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         if "-r3-" in req_id:  # pingtao add
             _write_kv_ttft_trace(  # pingtao add
                 "dram_to_hbm_load",  # pingtao add
+                req_id,  # pingtao add
+                elapsed_ms=load_ms,  # pingtao add
+                key_count=len(key_list_c),  # pingtao add
+                success=load_success,  # pingtao add
+            )  # pingtao add
+        if "-r4-" in req_id:  # pingtao add
+            _write_kv_ttft_trace(  # pingtao add
+                "ssd_to_hbm_load",  # pingtao add
                 req_id,  # pingtao add
                 elapsed_ms=load_ms,  # pingtao add
                 key_count=len(key_list_c),  # pingtao add
