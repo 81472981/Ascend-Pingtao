@@ -527,7 +527,9 @@ class DramPrefixCacheTest(unittest.TestCase):
                     0,
                     msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
                 )
-                self.assertIn("SSD写盘 | 新增", completed.stdout)
+                self.assertIn("SSD写盘完成 | 新增", completed.stdout)
+                self.assertIn("===== C1-R1/R2/R3 | Batch 1/1", completed.stdout)
+                self.assertIn("===== C1-R4 | Batch 1/1 | SSD验证 =====", completed.stdout)
                 self.assertNotIn("not stable", completed.stderr)
 
                 result_roots = list((root / "vb-result").iterdir())
@@ -599,14 +601,14 @@ class DramPrefixCacheTest(unittest.TestCase):
                 if openpyxl is not None:
                     loaded = openpyxl.load_workbook(workbook, read_only=True)
                     summary = loaded["Summary"]
-                    self.assertEqual(summary.max_row, 4)
+                    self.assertEqual(summary.max_row, 14)
                     self.assertEqual(
-                        [summary.cell(row=row, column=1).value for row in range(2, 5)],
+                        [summary.cell(row=row, column=1).value for row in (3, 7, 11)],
                         ["C1", "C5", "C10"],
                     )
                     self.assertEqual(
-                        [summary.cell(row=row, column=12).value for row in range(2, 5)],
-                        ["4/4", "20/20", "40/40"],
+                        [summary.cell(row=row, column=2).value for row in (3, 4, 5, 6)],
+                        ["R1-Warmup", "R2-HBM命中", "R3-DRAM命中", "R4-SSD命中"],
                     )
                     loaded.close()
         finally:

@@ -1067,23 +1067,120 @@ def shared_strings(sheets):
     xml = f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="{count}" uniqueCount="{len(values)}">{items}</sst>'
     return indexes, xml
 
+def excel_cell(reference, value, string_indexes, style_id=None):
+    style = f' s="{style_id}"' if style_id is not None else ''
+    if value in (None, ''):
+        return f'<c r="{reference}"{style}/>' if style else ''
+    if is_excel_number(value):
+        return f'<c r="{reference}"{style}><v>{value}</v></c>'
+    index = string_indexes[clean_excel_text(value)]
+    return f'<c r="{reference}"{style} t="s"><v>{index}</v></c>'
+
 def sheet_xml(rows, string_indexes):
     body = []
     for row_number, row in enumerate(rows, 1):
         cells = []
         for column_number, value in enumerate(row):
             reference = f'{col_name(column_number)}{row_number}'
-            if value in (None, ''):
-                continue
-            if is_excel_number(value):
-                cells.append(f'<c r="{reference}"><v>{value}</v></c>')
-            else:
-                index = string_indexes[clean_excel_text(value)]
-                cells.append(f'<c r="{reference}" t="s"><v>{index}</v></c>')
+            cell = excel_cell(reference, value, string_indexes)
+            if cell:
+                cells.append(cell)
         body.append(f'''<row r="{row_number}">{''.join(cells)}</row>''')
     last_column = col_name(max((len(row) for row in rows), default=1) - 1)
     last_row = max(len(rows), 1)
     return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:{last_column}{last_row}"/><sheetData>{''.join(body)}</sheetData></worksheet>"""
+
+def summary_sheet_xml(rows, string_indexes):
+    """Render the compact, grouped Summary layout supplied by the user.
+
+    The other sheets remain intentionally plain/raw: only Summary is a report
+    surface.  Style ids below are defined by summary_styles_xml().
+    """
+    columns = (11, 22, 15, 13, 11, 15, 16, 16, 15, 15, 16)
+    column_xml = ''.join(
+        f'<col min="{index}" max="{index}" width="{width}" customWidth="1"/>'
+        for index, width in enumerate(columns, 1)
+    )
+    body = []
+    for row_number, row in enumerate(rows, 1):
+        cells = []
+        for column_number, value in enumerate(row):
+            # 1/2: header; later rows: scenario+stage labels use blue, and
+            # dash cells use grey to make unavailable measurements explicit.
+            if row_number == 1:
+                style_id = 1
+            elif row_number == 2:
+                style_id = 2
+            elif column_number in (0, 1):
+                style_id = 3
+            elif value == '-':
+                style_id = 4
+            else:
+                style_id = 5
+            if row_number >= 3 and (row_number - 3) % 4 == 0:
+                style_id += 5  # medium top border at each C1/C5/C10 group
+            if row_number >= 3 and row_number % 4 == 2:
+                style_id += 10  # medium bottom border at group end
+            reference = f'{col_name(column_number)}{row_number}'
+            cell = excel_cell(reference, value, string_indexes, style_id)
+            if cell:
+                cells.append(cell)
+        height = ' ht="26" customHeight="1"' if row_number <= 2 else ' ht="21" customHeight="1"'
+        body.append(f'<row r="{row_number}"{height}>{"".join(cells)}</row>')
+    group_starts = list(range(3, len(rows) + 1, 4))
+    group_merges = ''.join(
+        f'<mergeCell ref="A{start}:A{start + 3}"/>'
+        for start in group_starts
+    )
+    merges = (
+        f'<mergeCells count="{7 + len(group_starts)}">'
+        '<mergeCell ref="A1:A2"/><mergeCell ref="B1:B2"/><mergeCell ref="C1:C2"/>'
+        '<mergeCell ref="D1:E1"/><mergeCell ref="F1:F2"/><mergeCell ref="G1:H1"/>'
+        '<mergeCell ref="I1:K1"/>'
+        f'{group_merges}</mergeCells>'
+    )
+    last_row = max(len(rows), 1)
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f'<dimension ref="A1:K{last_row}"/><sheetViews><sheetView workbookViewId="0" showGridLines="0"/>'
+        '</sheetViews><cols>' + column_xml + '</cols><sheetData>' + ''.join(body) +
+        '</sheetData>' + merges + '</worksheet>'
+    )
+
+def summary_styles_xml():
+    """Styles used exclusively by the grouped Summary report."""
+    font = '<font><sz val="11"/><name val="等线"/></font>'
+    fills = (
+        '<fills count="4"><fill><patternFill patternType="none"/></fill>'
+        '<fill><patternFill patternType="gray125"/></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFD9E2F3"/><bgColor indexed="64"/>'
+        '</patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFD9D9D9"/>'
+        '<bgColor indexed="64"/></patternFill></fill></fills>'
+    )
+    borders = (
+        '<borders count="4"><border/><border><left style="thin"/><right style="thin"/>'
+        '<top style="thin"/><bottom style="thin"/></border><border><left style="thin"/>'
+        '<right style="thin"/><top style="medium"/><bottom style="thin"/></border>'
+        '<border><left style="thin"/><right style="thin"/><top style="thin"/>'
+        '<bottom style="medium"/></border></borders>'
+    )
+    # styles 1-5: normal borders; 6-10: group-top; 11-15: group-bottom.
+    style_ids = [(2, 2), (2, 3), (2, 1), (3, 1), (0, 1)]
+    style_ids += [(fill, 2) for fill, _border in style_ids]
+    style_ids += [(fill, 3) for fill, _border in style_ids[:5]]
+    xfs = ''.join(
+        f'<xf numFmtId="0" fontId="0" fillId="{fill}" borderId="{border}" xfId="0" '
+        'applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>'
+        for fill, border in [(0, 0), *style_ids]
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f'<fonts count="1">{font}</fonts>{fills}{borders}<cellStyleXfs count="1">'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        f'<cellXfs count="{1 + len(style_ids)}">{xfs}</cellXfs></styleSheet>'
+    )
 
 def write_xlsx(path, sheets):
     string_indexes, strings_xml = shared_strings(sheets)
@@ -1095,7 +1192,9 @@ def write_xlsx(path, sheets):
         relationships += f'<Relationship Id="rId{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{index}.xml"/>'
         sheet_tags += f'<sheet name="{escape(name)}" sheetId="{index}" r:id="rId{index}"/>'
     content += '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>'
+    content += '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
     relationships += f'<Relationship Id="rId{len(sheets) + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>'
+    relationships += f'<Relationship Id="rId{len(sheets) + 2}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
     content += '</Types>'
     relationships += '</Relationships>'
     workbook = f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>{sheet_tags}</sheets></workbook>'
@@ -1106,8 +1205,10 @@ def write_xlsx(path, sheets):
         archive.writestr('xl/workbook.xml', workbook)
         archive.writestr('xl/_rels/workbook.xml.rels', relationships)
         archive.writestr('xl/sharedStrings.xml', strings_xml)
-        for index, rows in enumerate(sheets.values(), 1):
-            archive.writestr(f'xl/worksheets/sheet{index}.xml', sheet_xml(rows, string_indexes))
+        archive.writestr('xl/styles.xml', summary_styles_xml())
+        for index, (name, rows) in enumerate(sheets.items(), 1):
+            xml = summary_sheet_xml(rows, string_indexes) if name == 'Summary' else sheet_xml(rows, string_indexes)
+            archive.writestr(f'xl/worksheets/sheet{index}.xml', xml)
 
 def percent_change(current, baseline):
     if current is None or baseline in (None, 0):
@@ -1126,7 +1227,10 @@ def completed_payloads():
 
 def rebuild_workbook():
     payloads = completed_payloads()
-    summary = [['Concurrency', 'R1-Warmup-TTFT(s)', 'R2-HBM-TTFT(s)', 'R2-HBM-Lookup(s)', 'R3-DRAM-TTFT(s)', 'R3-DRAM-Lookup(s)', 'R3-DRAM-to-HBM(s)', 'R4-SSD-TTFT(s)', 'R3/R2-Degradation(s)', 'R3/R2-Degradation(%)', 'R4/R2-Degradation(s)', 'R4/R2-Degradation(%)', 'R4/R3-Degradation(s)', 'R4/R3-Degradation(%)', 'Success/All']]
+    summary = [
+        ['并发场景', '阶段', 'TTFT(s)', '对比HBM劣化', '', 'HBM开销', 'DRAM开销', '', 'SSD开销', '', ''],
+        ['', '', '', 's', '%', 'HBM-Lookup', 'DRAM-Lookup', 'DRAM->HBM', 'SSD-Lookup', 'SSD-DRAM', 'DRAM->HBM'],
+    ]
     stage_sheets = {stage: [RAW_HEADER] for stage in STAGES}
     validation = [VALIDATION_HEADER]
     for concurrency, payload in payloads.items():
@@ -1145,12 +1249,18 @@ def rebuild_workbook():
         r3_lookup = values['R3-dram-cache']['avg_dram_lookup_seconds']
         r3_load = values['R3-dram-cache']['avg_dram_to_hbm_seconds']
         r4 = values['R4-ssd-cache']['avg_ttft_seconds']
-        successful = sum(values[stage]['successful_requests'] for stage in STAGES)
-        total = sum(values[stage]['total_requests'] for stage in STAGES)
         r3_r2 = r3 - r2 if r2 is not None and r3 is not None else ''
         r4_r2 = r4 - r2 if r2 is not None and r4 is not None else ''
-        r4_r3 = r4 - r3 if r3 is not None and r4 is not None else ''
-        summary.append([f'C{concurrency}', r1 if r1 is not None else '', r2 if r2 is not None else '', r2_lookup if r2_lookup is not None else '', r3 if r3 is not None else '', r3_lookup if r3_lookup is not None else '', r3_load if r3_load is not None else '', r4 if r4 is not None else '', r3_r2, percent_change(r3, r2), r4_r2, percent_change(r4, r2), r4_r3, percent_change(r4, r3), f'{successful}/{total}'])
+        # Keep the presentation strictly aligned with the supplied Summary
+        # template: one Cx block, then R1/R2/R3/R4 in tier order.  There are
+        # no trustworthy SSD lookup sub-timers in this vLLM/Mooncake build, so
+        # leave those cells explicitly unavailable instead of fabricating data.
+        summary.extend([
+            [f'C{concurrency}', 'R1-Warmup', r1 if r1 is not None else '', '-', '-', '-', '-', '-', '-', '-', '-'],
+            ['', 'R2-HBM命中', r2 if r2 is not None else '', '-', '-', r2_lookup if r2_lookup is not None else '-', '-', '-', '-', '-', '-'],
+            ['', 'R3-DRAM命中', r3 if r3 is not None else '', r3_r2, percent_change(r3, r2), '-', r3_lookup if r3_lookup is not None else '-', r3_load if r3_load is not None else '-', '-', '-', '-'],
+            ['', 'R4-SSD命中', r4 if r4 is not None else '', r4_r2, percent_change(r4, r2), '-', '-', '-', '-', '-', '-'],
+        ])
     sheets = {'Summary': summary, **stage_sheets}
     sheets['validation'] = validation
     sheets['P1-manifest'] = manifest_rows
