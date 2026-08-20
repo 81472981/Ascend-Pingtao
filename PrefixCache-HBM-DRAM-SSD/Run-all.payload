@@ -1520,9 +1520,9 @@ def metric_text(value):
     return f'{value:.4f}' if value is not None else '-'
 
 def print_decision_table(results):
-    print('\n+-------+-------+---------+--------+---------+-------+--------------------------------------+')
-    print('| Stage | Tier  | TTFT(s) | Lookup | Load(s) | Valid | Evidence                             |')
-    print('+-------+-------+---------+--------+---------+-------+--------------------------------------+')
+    print('\n+-------+-------+---------+-----------------+----------------------+-------+----------------------------+')
+    print('| Stage | Cache | TTFT(s) | Cache lookup(s) | KV restore to HBM(s) | Valid | Evidence                   |')
+    print('+-------+-------+---------+-----------------+----------------------+-------+----------------------------+')
     for result in results:
         ttft = metric_text(result_ttft(result))
         if result['stage'] == 'R2-hbm-cache':
@@ -1537,8 +1537,8 @@ def print_decision_table(results):
         valid = f'{"OK" if result["valid"] else "X"} {result["completed"]}/{CONCURRENCY}'
         tier = result['source'] if len(result['source']) <= 5 else 'MIXED'
         evidence = f'{result["stage"].split("-", 1)[0]} {result["source"]}; {result_evidence(result)}'[:36]
-        print(f'| {result["stage"].split("-", 1)[0]:<5} | {tier:<5} | {ttft:>7} | {lookup:>6} | {load:>7} | {valid:<5} | {evidence:<36} |')
-    print('+-------+-------+---------+--------+---------+-------+--------------------------------------+')
+        print(f'| {result["stage"].split("-", 1)[0]:<5} | {tier:<5} | {ttft:>7} | {lookup:>15} | {load:>20} | {valid:<5} | {evidence:<26} |')
+    print('+-------+-------+---------+-----------------+----------------------+-------+----------------------------+')
 
 try:
     for batch in range(1, BATCHES + 1):
