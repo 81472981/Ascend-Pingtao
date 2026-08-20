@@ -8,7 +8,7 @@ STARTUP_START_TICKS=""
 if [ -r "/proc/$STARTUP_PID/stat" ]; then
   STARTUP_START_TICKS=$(awk '{print $22}' "/proc/$STARTUP_PID/stat")
 fi
-STARTUP_VERSION="restart-preserve-ssd-v3"
+STARTUP_VERSION="restart-preserve-ssd-v4"
 
 SERVED_NAME="Qwen3-8B"
 MODEL_PATH="/mnt/weight/${SERVED_NAME}"
@@ -607,13 +607,12 @@ export MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=$((SSD_BUFFER_MB * 1024 * 1024))
 # Set both explicitly: restart recovery must scan this exact session directory,
 # never Mooncake's default /data/file_storage.
 export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH="$SSD_SESSION_PATH"
-export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
-export MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE=$((SSD_QUOTA_GB * 1024 * 1024 * 1024))
+export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=file_per_key_storage_backend
 export MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=$((SSD_QUOTA_GB * 1024 * 1024 * 1024))
-export MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY=none
 # The benchmark owns this session and deletes it at exit.  Disable background
 # watermark eviction so a freshly persisted P1 cannot disappear before R4.
 export MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION=false
+export MOONCAKE_OFFLOAD_ENABLE_EVICTION=false
 # R3 后的短暂租约释放后尽快继续后台 SSD offload，避免受默认 10 秒 heartbeat 延迟。
 export MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1
 # 当前 Ascend 驱动在 io_uring_register_buffers(aclrtMallocHost buffer) 返回 EFAULT
@@ -644,7 +643,7 @@ cat > $MOONCAKE_JSON <<EOF
   "benchmark_ssd_page_cache_drop": true,
   "benchmark_ssd_io_mode": "posix-fadvise-dontneed",
   "benchmark_ssd_storage_path": "$SSD_SESSION_PATH",
-  "benchmark_ssd_storage_backend": "bucket_storage_backend",
+  "benchmark_ssd_storage_backend": "file_per_key_storage_backend",
   "benchmark_ssd_buffer_bytes": $((SSD_BUFFER_MB * 1024 * 1024)),
   "benchmark_ssd_overlay_verified": $SSD_OVERLAY_MODE,
   "benchmark_cleanup_managed": true,

@@ -1243,12 +1243,12 @@ def verify_preconditions():
         sys.exit('SSD path was not verified as a non-rotating block device by StartUp.sh')
     if not config.get('benchmark_ssd_page_cache_drop'):
         sys.exit('StartUp.sh did not enable the required per-R4 SSD page-cache drop')
-    if config.get('benchmark_startup_version') != 'restart-preserve-ssd-v3':
+    if config.get('benchmark_startup_version') != 'restart-preserve-ssd-v4':
         sys.exit('启动代码未启用完整SSD副本校验；请重新复制执行最新版StartUp.sh内容')
     if config.get('benchmark_ssd_storage_path') != config.get('ssd_offload_path'):
         sys.exit('StartUp.sh did not bind Mooncake FileStorage to this SSD session')
-    if config.get('benchmark_ssd_storage_backend') != 'bucket_storage_backend':
-        sys.exit('StartUp.sh did not select the recoverable Mooncake bucket SSD backend')
+    if config.get('benchmark_ssd_storage_backend') != 'file_per_key_storage_backend':
+        sys.exit('StartUp.sh did not select the recoverable per-key Mooncake SSD backend')
     SSD_BUFFER_BYTES = int(config.get('benchmark_ssd_buffer_bytes') or 0)
     if SSD_BUFFER_BYTES <= 0:
         sys.exit('StartUp.sh did not record the Mooncake SSD staging-buffer size')
@@ -1311,42 +1311,56 @@ def record_result(result, entries):
     validation_rows.append(validation_row(result))
     if not result['valid']:
         invalid_batches.append((result['batch'], result['stage'], result['reason']))
+
+def result_evidence(result):
     tier = result['storage_delta']
     local = result['delta']['local']
     external = result['delta']['external']
     local_rate = short_rate(local['rate'] if local else None)
     external_rate = short_rate(external['rate'] if external else None)
     if result['stage'] == 'R1-warmup':
-        evidence = f'理由=本地{local_rate},外部{external_rate}'
+        return f'local={local_rate}, external={external_rate}'
     elif result['stage'] == 'R2-hbm-cache':
-        evidence = f'理由=本地{local_rate}'
+        return f'local={local_rate}'
     elif result['stage'] == 'R3-dram-cache':
-        evidence = f'理由=本地{local_rate},外部{external_rate},DRAM{size_text(tier.get("dram_allocated_after"))},读盘{size_text(tier.get("runtime_read_bytes"))}'
-    else:
-        evidence = f'理由=本地{local_rate},外部{external_rate},读盘{size_text(tier.get("runtime_read_bytes"))}/{size_text(tier.get("required_ssd_read_bytes"))},NVMe≥读盘'
-    stage = result['stage'].split('-', 1)[0]
-    state = 'OK' if result['valid'] else 'X'
-    print(f'  {stage} {result["source"]} | {evidence} | {state}')
+        return (f'local={local_rate}, external={external_rate}, '
+                f'DRAM={size_text(tier.get("dram_allocated_after"))}, read={size_text(tier.get("runtime_read_bytes"))}')
+    return (f'local={local_rate}, external={external_rate}, '
+            f'read={size_text(tier.get("runtime_read_bytes"))}/{size_text(tier.get("required_ssd_read_bytes"))}, NVMe>=read')
 
-def print_terminal_table(payload):
-    print('\n+-------+---------------+----------+---------------+----------------+-----------------+-------+')
-    print('| Stage | Tier          | TTFT(s)  | HBM查找(s)    | DRAM查找(s)    | DRAM搬迁(s)    | Valid |')
-    print('+-------+---------------+----------+---------------+----------------+-----------------+-------+')
-    for stage in STAGES:
-        rows = [row for row in payload['validation_rows'] if row[2] == stage]
-        tiers = {row[19] for row in rows}
-        tier = next(iter(tiers)) if len(tiers) == 1 else 'MIXED'
-        valid = sum(row[20] == 'yes' for row in rows)
-        average = payload['stage_summary'][stage]['avg_ttft_seconds']
-        ttft = f'{average:.4f}' if average is not None else '-'
-        hbm_lookup_average = payload['stage_summary'][stage]['avg_hbm_lookup_seconds']
-        lookup_average = payload['stage_summary'][stage]['avg_dram_lookup_seconds']
-        load_average = payload['stage_summary'][stage]['avg_dram_to_hbm_seconds']
-        hbm_lookup = f'{hbm_lookup_average:.4f}' if hbm_lookup_average is not None else '-'
-        lookup = f'{lookup_average:.4f}' if lookup_average is not None else '-'
-        load = f'{load_average:.4f}' if load_average is not None else '-'
-        print(f'| {stage.split("-", 1)[0]:<5} | {tier:<13} | {ttft:>8} | {hbm_lookup:>13} | {lookup:>14} | {load:>15} | {valid:>2}/{len(rows):<2} |')
-    print('+-------+---------------+----------+---------------+----------------+-----------------+-------+')
+def result_ttft(result):
+    ttfts = result['data'].get('ttfts') or []
+    errors = result['data'].get('errors') or []
+    values = [float(ttft) for index, ttft in enumerate(ttfts) if ttft is not None and not (errors[index] if index < len(errors) else None)]
+    return statistics.fmean(values) if values else None
+
+def result_trace_average(result, field):
+    if result['stage'] not in ('R2-hbm-cache', 'R3-dram-cache'):
+        return None
+    values = []
+    for capture in result['captures']:
+        trace = result['kv_traces'].get(capture['request_id'])
+        status = r2_trace_status(trace) if result['stage'] == 'R2-hbm-cache' else r3_trace_status(trace)
+        if status == 'complete' and trace and field in trace:
+            values.append(float(trace[field]))
+    return statistics.fmean(values) if values else None
+
+def metric_text(value):
+    return f'{value:.4f}' if value is not None else '-'
+
+def print_decision_table(results):
+    print('\n+-------+---------------+----------+---------------+----------------+-----------------+-------+----------------------------------------------------------+')
+    print('| Stage | Tier          | TTFT(s)  | HBM lookup(s) | DRAM lookup(s) | DRAM move(s)    | Valid | Evidence                                                 |')
+    print('+-------+---------------+----------+---------------+----------------+-----------------+-------+----------------------------------------------------------+')
+    for result in results:
+        ttft = metric_text(result_ttft(result))
+        hbm_lookup = metric_text(result_trace_average(result, 'hbm_lookup_seconds'))
+        dram_lookup = metric_text(result_trace_average(result, 'dram_lookup_seconds'))
+        dram_move = metric_text(result_trace_average(result, 'dram_to_hbm_seconds'))
+        valid = f'{"OK" if result["valid"] else "X"} {result["completed"]}/{CONCURRENCY}'
+        evidence = f'{result["stage"].split("-", 1)[0]} {result["source"]}; {result_evidence(result)}'[:56]
+        print(f'| {result["stage"].split("-", 1)[0]:<5} | {result["source"]:<13} | {ttft:>8} | {hbm_lookup:>13} | {dram_lookup:>14} | {dram_move:>15} | {valid:<5} | {evidence:<56} |')
+    print('+-------+---------------+----------+---------------+----------------+-----------------+-------+----------------------------------------------------------+')
 
 try:
     for batch in range(1, BATCHES + 1):
@@ -1371,12 +1385,6 @@ try:
                 f'R1 did not create a measurable DRAM copy: {dram_bytes_before} -> {dram_bytes_after}'
             )
         batch_dram_bytes = int(dram_bytes_after - dram_bytes_before)
-        required_buffer_bytes = batch_dram_bytes * 2
-        if SSD_BUFFER_BYTES < required_buffer_bytes:
-            raise RuntimeError(
-                f'SSD staging buffer too small: configured={size_text(SSD_BUFFER_BYTES)}, '
-                f'required>={size_text(required_buffer_bytes)} for DRAM batch={size_text(batch_dram_bytes)}'
-            )
         ssd_bytes_after = wait_ssd_replicas(ssd_bytes_before, batch_dram_bytes)
         batch_ssd_replica_bytes = int(ssd_bytes_after - ssd_bytes_before)
         required_ssd_read_bytes = batch_dram_bytes
@@ -1392,6 +1400,7 @@ try:
         r3 = run_stage(vllm, 'R3-dram-cache', batch, seed, entries, reset_evidence=pre_r3_reset)
         for result in (r1, r2, r3):
             record_result(result, entries)
+        print_decision_table((r1, r2, r3))
         batch_contexts.append((batch, seed, entries, required_ssd_read_bytes))
 
     if R3_LEASE_SETTLE_SECONDS:
@@ -1413,11 +1422,11 @@ try:
         print('  R4清页缓存 | OK')
         r4 = run_stage(vllm, 'R4-ssd-cache', batch, seed, entries, reset_evidence=f'{pre_r4_reset}; {restart_evidence}; {cache_drop_evidence}', restart_verified=True, required_ssd_read_bytes=required_ssd_read_bytes)
         record_result(r4, entries)
+        print_decision_table((r4,))
 finally:
     proxy.shutdown()
     proxy.server_close()
 payload = build_payload(stage_rows, validation_rows)
-print_terminal_table(payload)
 RESULT_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
 session['completed_concurrencies'] = sorted(set(session.get('completed_concurrencies', [])) | {CONCURRENCY})
 SESSION_PATH.write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding='utf-8')
