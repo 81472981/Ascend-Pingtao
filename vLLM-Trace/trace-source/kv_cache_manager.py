@@ -30,7 +30,7 @@ def _write_hbm_lookup_trace(event: str, request_id: str, **fields: Any) -> None:
     trace_path = os.environ.get("VB_KV_TRACE_FILE")  # pingtao add
     if not trace_path or "-r2-" not in request_id:  # pingtao add
         return  # pingtao add
-    payload = {"event": event, "request_id": request_id, **fields}  # pingtao add
+    payload = {"event": event, "request_id": request_id, "pid": os.getpid(), **fields}  # pingtao add
     try:  # pingtao add
         fd = os.open(trace_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)  # pingtao add
         try:  # pingtao add

@@ -48,17 +48,17 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 
 
 # ============================================================================
-# R3 TTFT INSTRUMENTATION -- DRAM LOOKUP TRACE OUTPUT
+# R3/R4 TTFT INSTRUMENTATION -- EXTERNAL LOOKUP TRACE OUTPUT
 #
-# The benchmark supplies request IDs such as "p1-c1-b1-r3-0".  Only those R3
-# requests are emitted.  Set VB_KV_TRACE_FILE before starting vLLM, for example:
+# The benchmark supplies request IDs such as "p1-c1-b1-r3-0" and "...-r4-0".
+# Only R3/R4 requests are emitted. Set VB_KV_TRACE_FILE before starting vLLM:
 #   export VB_KV_TRACE_FILE=/tmp/vb-kv-timing.jsonl
 # ============================================================================
-def _write_r3_ttft_trace(event: str, request_id: str, **fields: Any) -> None:  # pingtao add
+def _write_kv_ttft_trace(event: str, request_id: str, **fields: Any) -> None:  # pingtao add
     trace_path = os.environ.get("VB_KV_TRACE_FILE")  # pingtao add
-    if not trace_path or "-r3-" not in request_id:  # pingtao add
+    if not trace_path or not any(stage in request_id for stage in ("-r3-", "-r4-")):  # pingtao add
         return  # pingtao add
-    payload = {"event": event, "request_id": request_id, **fields}  # pingtao add
+    payload = {"event": event, "request_id": request_id, "pid": os.getpid(), **fields}  # pingtao add
     try:  # pingtao add
         fd = os.open(trace_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)  # pingtao add
         try:  # pingtao add
@@ -66,7 +66,7 @@ def _write_r3_ttft_trace(event: str, request_id: str, **fields: Any) -> None:  #
         finally:  # pingtao add
             os.close(fd)  # pingtao add
     except OSError as error:  # pingtao add
-        logger.warning("R3 TTFT trace write failed for request %s: %s", request_id, error)  # pingtao add
+        logger.warning("KV TTFT trace write failed for request %s: %s", request_id, error)  # pingtao add
 
 
 class KVPoolScheduler:
@@ -541,7 +541,7 @@ class KVPoolScheduler:
                     self.client = LookupKeyClient(self.vllm_config)
 
                 # ============================================================
-                # R3 TTFT INSTRUMENTATION -- DRAM CACHE LOOKUP START
+                # R3/R4 TTFT INSTRUMENTATION -- EXTERNAL CACHE LOOKUP START
                 # Measures the complete lookup IPC/RPC round trip seen by this
                 # request, from issuing the lookup until hit tokens are known.
                 # ============================================================
@@ -552,14 +552,15 @@ class KVPoolScheduler:
                     self.kv_cache_group_ids,
                 )
                 lookup_ms = (time.perf_counter_ns() - lookup_start_ns) / 1_000_000  # pingtao add
-                _write_r3_ttft_trace(  # pingtao add
-                    "dram_lookup",  # pingtao add
+                lookup_event = "ssd_lookup" if "-r4-" in request.request_id else "dram_lookup"  # pingtao add
+                _write_kv_ttft_trace(  # pingtao add
+                    lookup_event,  # pingtao add
                     request.request_id,  # pingtao add
                     elapsed_ms=lookup_ms,  # pingtao add
                     hit_tokens=num_external_hit_tokens,  # pingtao add
                 )  # pingtao add
                 # ============================================================
-                # R3 TTFT INSTRUMENTATION -- DRAM CACHE LOOKUP END
+                # R3/R4 TTFT INSTRUMENTATION -- EXTERNAL CACHE LOOKUP END
                 # ============================================================
 
         if num_external_hit_tokens == 0:

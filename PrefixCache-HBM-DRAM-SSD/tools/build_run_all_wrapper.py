@@ -20,7 +20,7 @@ TARGET = ROOT / "Run-all"
 
 def render(source: bytes) -> bytes:
     digest = hashlib.sha256(source).hexdigest()
-    encoded = base64.b64encode(zlib.compress(source, level=9)).decode("ascii")
+    encoded = base64.b85encode(zlib.compress(source, level=9)).decode("ascii")
     chunks = "\n".join(
         f"    b'{line}'" for line in textwrap.wrap(encoded, width=96)
     )
@@ -36,7 +36,7 @@ import zlib
 encoded = (
 {chunks}
 )
-payload = zlib.decompress(base64.b64decode(encoded, validate=True))
+payload = zlib.decompress(base64.b85decode(encoded))
 expected = '{digest}'
 actual = hashlib.sha256(payload).hexdigest()
 if actual != expected:

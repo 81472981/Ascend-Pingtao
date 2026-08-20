@@ -33,15 +33,15 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 
 
 # ============================================================================
-# R3 TTFT INSTRUMENTATION -- DRAM TO HBM LOAD TRACE OUTPUT
-# Only benchmark R3 request IDs are emitted.  VB_KV_TRACE_FILE must point to a
+# R3/R4 TTFT INSTRUMENTATION -- KV LOAD TRACE OUTPUT
+# Only benchmark R3/R4 request IDs are emitted.  VB_KV_TRACE_FILE must point to a
 # writable JSONL file shared by the scheduler and worker processes.
 # ============================================================================
-def _write_r3_ttft_trace(event: str, request_id: str, **fields: Any) -> None:  # pingtao add
+def _write_kv_ttft_trace(event: str, request_id: str, **fields: Any) -> None:  # pingtao add
     trace_path = os.environ.get("VB_KV_TRACE_FILE")  # pingtao add
-    if not trace_path or "-r3-" not in request_id:  # pingtao add
+    if not trace_path or not any(stage in request_id for stage in ("-r3-", "-r4-")):  # pingtao add
         return  # pingtao add
-    payload = {"event": event, "request_id": request_id, **fields}  # pingtao add
+    payload = {"event": event, "request_id": request_id, "pid": os.getpid(), **fields}  # pingtao add
     try:  # pingtao add
         fd = os.open(trace_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)  # pingtao add
         try:  # pingtao add
@@ -49,7 +49,7 @@ def _write_r3_ttft_trace(event: str, request_id: str, **fields: Any) -> None:  #
         finally:  # pingtao add
             os.close(fd)  # pingtao add
     except OSError as error:  # pingtao add
-        logger.warning("R3 TTFT trace write failed for request %s: %s", request_id, error)  # pingtao add
+        logger.warning("KV TTFT trace write failed for request %s: %s", request_id, error)  # pingtao add
 
 
 def _circular_shift(lst: list, offset: int) -> list:
@@ -927,17 +927,25 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         # m_store.get() does not return until this request's KV load has
         # completed; this deliberately measures completion, not enqueue time.
         # ================================================================
+        if "-r4-" in req_id:  # pingtao add
+            _write_kv_ttft_trace(  # pingtao add
+                "r4_load_keys",  # pingtao add
+                req_id,  # pingtao add
+                elapsed_ms=0,  # pingtao add
+                keys=key_list_c,  # pingtao add
+            )  # pingtao add
         load_start_ns = time.perf_counter_ns()  # pingtao add
         ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
         load_ms = (time.perf_counter_ns() - load_start_ns) / 1_000_000  # pingtao add
         load_success = ret is not None and all(result == 0 for result in ret)  # pingtao add
-        _write_r3_ttft_trace(  # pingtao add
-            "dram_to_hbm_load",  # pingtao add
-            req_id,  # pingtao add
-            elapsed_ms=load_ms,  # pingtao add
-            key_count=len(key_list_c),  # pingtao add
-            success=load_success,  # pingtao add
-        )  # pingtao add
+        if "-r3-" in req_id:  # pingtao add
+            _write_kv_ttft_trace(  # pingtao add
+                "dram_to_hbm_load",  # pingtao add
+                req_id,  # pingtao add
+                elapsed_ms=load_ms,  # pingtao add
+                key_count=len(key_list_c),  # pingtao add
+                success=load_success,  # pingtao add
+            )  # pingtao add
         # ================================================================
         # R3 TTFT INSTRUMENTATION -- DRAM KV TO HBM LOAD END
         # ================================================================

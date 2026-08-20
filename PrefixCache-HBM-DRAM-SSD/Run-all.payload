@@ -881,25 +881,78 @@ def kv_trace_since(offset):
         return {}
     except OSError as error:
         raise RuntimeError(f'cannot read KV trace {KV_TRACE_PATH}: {error}') from error
-    traces = {}
+    records = []
     for line in payload.splitlines():
         try:
             record = json.loads(line)
-            request_id = record['request_id']
-            elapsed_seconds = float(record['elapsed_ms']) / 1000
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            if not isinstance(record, dict) or 'event' not in record:
+                raise ValueError('record must be an object with an event')
+            records.append(record)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
             raise RuntimeError(f'invalid KV trace record: {line!r}') from error
+    traces = {}
+    key_requests = {}
+    for record in records:
+        if record.get('event') != 'r4_load_keys':
+            continue
+        request_id = record.get('request_id')
+        if not request_id:
+            continue
         item = traces.setdefault(request_id, {})
-        if record.get('event') == 'hbm_lookup':
-            item['hbm_lookup_seconds'] = item.get('hbm_lookup_seconds', 0) + elapsed_seconds
+        item['r4_keys_seen'] = True
+        for key in record.get('keys') or []:
+            key_requests.setdefault(str(key), set()).add(request_id)
+
+    def add_metric(item, field, record):
+        try:
+            elapsed_seconds = float(record['elapsed_ms']) / 1000
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError(f'invalid elapsed time in KV trace record: {record!r}') from error
+        pid = str(record.get('pid', 'unknown'))
+        by_pid = item.setdefault('_metric_by_pid', {}).setdefault(field, {})
+        by_pid[pid] = by_pid.get(pid, 0) + elapsed_seconds
+        item[field] = max(by_pid.values())
+
+    def add_success(item, field, record):
+        pid = str(record.get('pid', 'unknown'))
+        by_pid = item.setdefault('_success_by_pid', {}).setdefault(field, {})
+        by_pid[pid] = by_pid.get(pid, True) and bool(record.get('success'))
+        item[field] = all(by_pid.values())
+
+    fields = {
+        'hbm_lookup': 'hbm_lookup_seconds',
+        'dram_lookup': 'dram_lookup_seconds',
+        'dram_to_hbm_load': 'dram_to_hbm_seconds',
+        'ssd_lookup': 'ssd_lookup_seconds',
+        'ssd_to_dram': 'ssd_to_dram_seconds',
+        'dram_to_hbm': 'r4_dram_to_hbm_seconds',
+    }
+    for record in records:
+        event = record.get('event')
+        if event == 'r4_load_keys' or event not in fields:
+            continue
+        request_ids = set()
+        if record.get('request_id'):
+            request_ids.add(record['request_id'])
+        for key in record.get('keys') or []:
+            request_ids.update(key_requests.get(str(key), ()))
+        if len(request_ids) != 1:
+            continue
+        request_id = next(iter(request_ids))
+        item = traces.setdefault(request_id, {})
+        field = fields[event]
+        add_metric(item, field, record)
+        if event == 'hbm_lookup':
             item['hbm_hit_tokens'] = record.get('hit_tokens')
-        elif record.get('event') == 'dram_lookup':
-            item['dram_lookup_seconds'] = item.get('dram_lookup_seconds', 0) + elapsed_seconds
+        elif event == 'dram_lookup':
             item['hit_tokens'] = record.get('hit_tokens')
-        elif record.get('event') == 'dram_to_hbm_load':
-            item['dram_to_hbm_seconds'] = item.get('dram_to_hbm_seconds', 0) + elapsed_seconds
-            item['dram_to_hbm_success'] = bool(record.get('success'))
+        elif event == 'dram_to_hbm_load':
+            add_success(item, 'dram_to_hbm_success', record)
             item['key_count'] = record.get('key_count')
+        elif event == 'ssd_to_dram':
+            add_success(item, 'ssd_to_dram_success', record)
+        elif event == 'dram_to_hbm':
+            add_success(item, 'r4_dram_to_hbm_success', record)
     return traces
 
 def r3_trace_status(trace):
@@ -920,6 +973,21 @@ def r2_trace_status(trace):
         return 'missing_lookup'
     return 'complete'
 
+def r4_trace_status(trace):
+    if trace is None:
+        return 'missing_trace' if KV_TRACE_PATH is not None else 'not_configured'
+    if 'ssd_lookup_seconds' not in trace:
+        return 'missing_ssd_lookup'
+    if 'ssd_to_dram_seconds' not in trace:
+        return 'missing_ssd_to_dram'
+    if not trace.get('ssd_to_dram_success'):
+        return 'ssd_to_dram_failed'
+    if 'r4_dram_to_hbm_seconds' not in trace:
+        return 'missing_dram_to_hbm'
+    if not trace.get('r4_dram_to_hbm_success'):
+        return 'dram_to_hbm_failed'
+    return 'complete'
+
 def run_stage(vllm, stage, batch, seed, expected_entries, reset_evidence='', restart_verified=False, required_ssd_read_bytes=0):
     stage_slug = stage.split('-', 1)[0].lower()
     request_prefix = f'p1-c{CONCURRENCY}-b{batch}-{stage_slug}-'
@@ -931,7 +999,7 @@ def run_stage(vllm, stage, batch, seed, expected_entries, reset_evidence='', res
     tier_before = tier_metrics()
     runtime_reads_before = runtime_read_bytes()
     device_reads_before = ssd_device_read_bytes()
-    trace_offset = kv_trace_offset() if stage in ('R2-hbm-cache', 'R3-dram-cache') else None
+    trace_offset = kv_trace_offset() if stage in ('R2-hbm-cache', 'R3-dram-cache', 'R4-ssd-cache') else None
     run_command(benchmark_command(vllm, stage, batch, seed, filename, request_prefix))
     after = cache_metrics()
     tier_after = tier_metrics()
@@ -982,6 +1050,8 @@ def run_stage(vllm, stage, batch, seed, expected_entries, reset_evidence='', res
         trace_statuses = [r2_trace_status(kv_traces.get(capture['request_id'])) for capture in captures]
     elif stage == 'R3-dram-cache':
         trace_statuses = [r3_trace_status(kv_traces.get(capture['request_id'])) for capture in captures]
+    elif stage == 'R4-ssd-cache':
+        trace_statuses = [r4_trace_status(kv_traces.get(capture['request_id'])) for capture in captures]
     else:
         trace_statuses = []
     return {'stage': stage, 'batch': batch, 'seed': seed, 'filename': filename, 'data': data, 'captures': captures, 'hashes': hashes, 'delta': delta, 'storage_delta': storage_delta, 'completed': completed, 'failed': failed, 'input_valid': input_valid, 'identity_valid': identity_valid, 'source': source, 'valid': valid, 'reason': '; '.join(reason_parts), 'reset_evidence': reset_evidence, 'kv_traces': kv_traces, 'kv_trace_statuses': trace_statuses}
@@ -997,12 +1067,19 @@ def raw_rows_for(stage_result, entries):
     for index, entry in enumerate(entries):
         capture = stage_result['captures'][index] if index < len(stage_result['captures']) else {}
         request_id = capture.get('request_id', '')
-        trace = stage_result['kv_traces'].get(request_id) if stage_result['stage'] in ('R2-hbm-cache', 'R3-dram-cache') else None
-        trace_status = r2_trace_status(trace) if stage_result['stage'] == 'R2-hbm-cache' else r3_trace_status(trace) if stage_result['stage'] == 'R3-dram-cache' else ''
+        trace = stage_result['kv_traces'].get(request_id) if stage_result['stage'] in ('R2-hbm-cache', 'R3-dram-cache', 'R4-ssd-cache') else None
+        if stage_result['stage'] == 'R2-hbm-cache':
+            trace_status = r2_trace_status(trace)
+        elif stage_result['stage'] == 'R3-dram-cache':
+            trace_status = r3_trace_status(trace)
+        elif stage_result['stage'] == 'R4-ssd-cache':
+            trace_status = r4_trace_status(trace)
+        else:
+            trace_status = ''
         error = errors[index] if index < len(errors) else 'missing result'
         ttft = ttfts[index] if index < len(ttfts) else None
         request_valid = stage_result['valid'] and ttft is not None and (not error)
-        rows.append([stage_result['stage'], CONCURRENCY, stage_result['batch'], entry['prompt_id'], index + 1, stage_result['seed'], float(ttft) if ttft is not None else '', input_lens[index] if index < len(input_lens) else '', output_lens[index] if index < len(output_lens) else '', entry['prompt_sha256'], entry['token_sha256'], entry['first_block_sha256'], generated[index] if index < len(generated) else '', stage_result['source'], 'yes' if request_valid else 'no', error or '', stage_result['filename'], request_id, trace.get('hbm_lookup_seconds', '') if trace else '', trace.get('dram_lookup_seconds', '') if trace else '', trace.get('dram_to_hbm_seconds', '') if trace else '', trace.get('dram_to_hbm_success', '') if trace else '', trace_status])
+        rows.append([stage_result['stage'], CONCURRENCY, stage_result['batch'], entry['prompt_id'], index + 1, stage_result['seed'], float(ttft) if ttft is not None else '', input_lens[index] if index < len(input_lens) else '', output_lens[index] if index < len(output_lens) else '', entry['prompt_sha256'], entry['token_sha256'], entry['first_block_sha256'], generated[index] if index < len(generated) else '', stage_result['source'], 'yes' if request_valid else 'no', error or '', stage_result['filename'], request_id, trace.get('hbm_lookup_seconds', '') if trace else '', trace.get('dram_lookup_seconds', '') if trace else '', trace.get('dram_to_hbm_seconds', '') if trace else '', trace.get('dram_to_hbm_success', '') if trace else '', trace_status, trace.get('ssd_lookup_seconds', '') if trace else '', trace.get('ssd_to_dram_seconds', '') if trace else '', trace.get('r4_dram_to_hbm_seconds', '') if trace else '', trace.get('ssd_to_dram_success', '') if trace else '', trace.get('r4_dram_to_hbm_success', '') if trace else ''])
     return rows
 
 def validation_row(stage_result):
@@ -1023,7 +1100,7 @@ def validation_row(stage_result):
         sum(status == 'complete' for status in stage_result['kv_trace_statuses']),
         ','.join(sorted(set(stage_result['kv_trace_statuses']))) if stage_result['kv_trace_statuses'] else '',
     ]
-RAW_HEADER = ['stage', 'concurrency', 'batch', 'prompt_id', 'request_index', 'seed', 'ttft_seconds', 'input_tokens', 'output_tokens', 'prompt_sha256', 'token_sha256', 'first_block_sha256', 'output_text', 'source', 'valid_request', 'error', 'result_file', 'request_id', 'hbm_lookup_seconds', 'dram_lookup_seconds', 'dram_to_hbm_seconds', 'dram_to_hbm_success', 'kv_trace_status']
+RAW_HEADER = ['stage', 'concurrency', 'batch', 'prompt_id', 'request_index', 'seed', 'ttft_seconds', 'input_tokens', 'output_tokens', 'prompt_sha256', 'token_sha256', 'first_block_sha256', 'output_text', 'source', 'valid_request', 'error', 'result_file', 'request_id', 'hbm_lookup_seconds', 'dram_lookup_seconds', 'dram_to_hbm_seconds', 'dram_to_hbm_success', 'kv_trace_status', 'ssd_lookup_seconds', 'ssd_to_dram_seconds', 'r4_dram_to_hbm_seconds', 'ssd_to_dram_success', 'r4_dram_to_hbm_success']
 VALIDATION_HEADER = ['concurrency', 'batch', 'stage', 'completed', 'failed', 'prompt_identity_valid', 'input_length_valid', 'local_queries', 'local_hits', 'local_rate', 'external_queries', 'external_hits', 'external_rate', 'dram_allocated_before', 'dram_allocated_after', 'ssd_allocated_before', 'ssd_allocated_after', 'runtime_read_bytes', 'ssd_device_read_bytes', 'source', 'valid_batch', 'reason', 'reset_evidence', 'required_ssd_read_bytes', 'kv_trace_requests', 'kv_trace_complete', 'kv_trace_statuses']
 
 def col_name(index):
@@ -1249,17 +1326,18 @@ def rebuild_workbook():
         r3_lookup = values['R3-dram-cache']['avg_dram_lookup_seconds']
         r3_load = values['R3-dram-cache']['avg_dram_to_hbm_seconds']
         r4 = values['R4-ssd-cache']['avg_ttft_seconds']
+        r4_lookup = values['R4-ssd-cache']['avg_ssd_lookup_seconds']
+        r4_ssd_to_dram = values['R4-ssd-cache']['avg_ssd_to_dram_seconds']
+        r4_dram_to_hbm = values['R4-ssd-cache']['avg_r4_dram_to_hbm_seconds']
         r3_r2 = r3 - r2 if r2 is not None and r3 is not None else ''
         r4_r2 = r4 - r2 if r2 is not None and r4 is not None else ''
         # Keep the presentation strictly aligned with the supplied Summary
-        # template: one Cx block, then R1/R2/R3/R4 in tier order.  There are
-        # no trustworthy SSD lookup sub-timers in this vLLM/Mooncake build, so
-        # leave those cells explicitly unavailable instead of fabricating data.
+        # template: one Cx block, then R1/R2/R3/R4 in tier order.
         summary.extend([
             [f'C{concurrency}', 'R1-Warmup', r1 if r1 is not None else '', '-', '-', '-', '-', '-', '-', '-', '-'],
             ['', 'R2-HBM命中', r2 if r2 is not None else '', '-', '-', r2_lookup if r2_lookup is not None else '-', '-', '-', '-', '-', '-'],
             ['', 'R3-DRAM命中', r3 if r3 is not None else '', r3_r2, percent_change(r3, r2), '-', r3_lookup if r3_lookup is not None else '-', r3_load if r3_load is not None else '-', '-', '-', '-'],
-            ['', 'R4-SSD命中', r4 if r4 is not None else '', r4_r2, percent_change(r4, r2), '-', '-', '-', '-', '-', '-'],
+            ['', 'R4-SSD命中', r4 if r4 is not None else '', r4_r2, percent_change(r4, r2), '-', '-', '-', r4_lookup if r4_lookup is not None else '-', r4_ssd_to_dram if r4_ssd_to_dram is not None else '-', r4_dram_to_hbm if r4_dram_to_hbm is not None else '-'],
         ])
     sheets = {'Summary': summary, **stage_sheets}
     sheets['validation'] = validation
@@ -1274,9 +1352,12 @@ def build_payload(stage_rows, validation_rows):
         hbm_lookup_values = [float(row[18]) for row in stage_rows[stage] if row[14] == 'yes' and row[18] != '' and row[22] == 'complete']
         lookup_values = [float(row[19]) for row in stage_rows[stage] if row[14] == 'yes' and row[19] != '' and row[22] == 'complete']
         load_values = [float(row[20]) for row in stage_rows[stage] if row[14] == 'yes' and row[20] != '' and row[22] == 'complete']
+        ssd_lookup_values = [float(row[23]) for row in stage_rows[stage] if row[14] == 'yes' and row[23] != '' and row[22] == 'complete']
+        ssd_to_dram_values = [float(row[24]) for row in stage_rows[stage] if row[14] == 'yes' and row[24] != '' and row[22] == 'complete']
+        r4_dram_to_hbm_values = [float(row[25]) for row in stage_rows[stage] if row[14] == 'yes' and row[25] != '' and row[22] == 'complete']
         total = CONCURRENCY * BATCHES
         successful = sum((1 for row in stage_rows[stage] if row[6] != '' and (not row[15])))
-        item = {'successful_requests': successful, 'total_requests': total, 'success_rate_percent': successful / total * 100 if total else 0, 'ttft_samples': len(values), 'avg_ttft_seconds': statistics.fmean(values) if values else None, 'min_ttft_seconds': min(values) if values else None, 'max_ttft_seconds': max(values) if values else None, 'hbm_lookup_samples': len(hbm_lookup_values), 'avg_hbm_lookup_seconds': statistics.fmean(hbm_lookup_values) if hbm_lookup_values else None, 'dram_lookup_samples': len(lookup_values), 'avg_dram_lookup_seconds': statistics.fmean(lookup_values) if lookup_values else None, 'dram_to_hbm_samples': len(load_values), 'avg_dram_to_hbm_seconds': statistics.fmean(load_values) if load_values else None}
+        item = {'successful_requests': successful, 'total_requests': total, 'success_rate_percent': successful / total * 100 if total else 0, 'ttft_samples': len(values), 'avg_ttft_seconds': statistics.fmean(values) if values else None, 'min_ttft_seconds': min(values) if values else None, 'max_ttft_seconds': max(values) if values else None, 'hbm_lookup_samples': len(hbm_lookup_values), 'avg_hbm_lookup_seconds': statistics.fmean(hbm_lookup_values) if hbm_lookup_values else None, 'dram_lookup_samples': len(lookup_values), 'avg_dram_lookup_seconds': statistics.fmean(lookup_values) if lookup_values else None, 'dram_to_hbm_samples': len(load_values), 'avg_dram_to_hbm_seconds': statistics.fmean(load_values) if load_values else None, 'ssd_lookup_samples': len(ssd_lookup_values), 'avg_ssd_lookup_seconds': statistics.fmean(ssd_lookup_values) if ssd_lookup_values else None, 'ssd_to_dram_samples': len(ssd_to_dram_values), 'avg_ssd_to_dram_seconds': statistics.fmean(ssd_to_dram_values) if ssd_to_dram_values else None, 'r4_dram_to_hbm_samples': len(r4_dram_to_hbm_values), 'avg_r4_dram_to_hbm_seconds': statistics.fmean(r4_dram_to_hbm_values) if r4_dram_to_hbm_values else None}
         stage_summary[stage] = item
         summary_rows.append([stage, CONCURRENCY, item['successful_requests'], item['total_requests'], item['success_rate_percent'], item['ttft_samples'], item['avg_ttft_seconds'] if item['avg_ttft_seconds'] is not None else '', item['min_ttft_seconds'] if item['min_ttft_seconds'] is not None else '', item['max_ttft_seconds'] if item['max_ttft_seconds'] is not None else ''])
     return {'created_at': now_cn(), 'concurrency': CONCURRENCY, 'batches': BATCHES, 'input_tokens': INPUT_LEN, 'block_size': BLOCK_SIZE, 'stage_rows': stage_rows, 'validation_rows': validation_rows, 'summary_rows': summary_rows, 'stage_summary': stage_summary}
@@ -1445,12 +1526,17 @@ def result_ttft(result):
     return statistics.fmean(values) if values else None
 
 def result_trace_average(result, field):
-    if result['stage'] not in ('R2-hbm-cache', 'R3-dram-cache'):
+    if result['stage'] not in ('R2-hbm-cache', 'R3-dram-cache', 'R4-ssd-cache'):
         return None
     values = []
     for capture in result['captures']:
         trace = result['kv_traces'].get(capture['request_id'])
-        status = r2_trace_status(trace) if result['stage'] == 'R2-hbm-cache' else r3_trace_status(trace)
+        if result['stage'] == 'R2-hbm-cache':
+            status = r2_trace_status(trace)
+        elif result['stage'] == 'R3-dram-cache':
+            status = r3_trace_status(trace)
+        else:
+            status = r4_trace_status(trace)
         if status == 'complete' and trace and field in trace:
             values.append(float(trace[field]))
     return statistics.fmean(values) if values else None
@@ -1460,17 +1546,23 @@ def metric_text(value):
 
 def print_decision_table(results):
     print('\n+-------+-------+---------+--------+---------+---------+-------+--------------------------------------+')
-    print('| Stage | Tier  | TTFT(s) | HBM(s) | DRAM(s) | Move(s) | Valid | Evidence                             |')
+    print('| Stage | Tier  | TTFT(s) | Lookup | Read(s) | Move(s) | Valid | Evidence                             |')
     print('+-------+-------+---------+--------+---------+---------+-------+--------------------------------------+')
     for result in results:
         ttft = metric_text(result_ttft(result))
-        hbm_lookup = metric_text(result_trace_average(result, 'hbm_lookup_seconds'))
-        dram_lookup = metric_text(result_trace_average(result, 'dram_lookup_seconds'))
-        dram_move = metric_text(result_trace_average(result, 'dram_to_hbm_seconds'))
+        if result['stage'] == 'R2-hbm-cache':
+            fields = ('hbm_lookup_seconds', None, None)
+        elif result['stage'] == 'R3-dram-cache':
+            fields = ('dram_lookup_seconds', None, 'dram_to_hbm_seconds')
+        elif result['stage'] == 'R4-ssd-cache':
+            fields = ('ssd_lookup_seconds', 'ssd_to_dram_seconds', 'r4_dram_to_hbm_seconds')
+        else:
+            fields = (None, None, None)
+        lookup, read, move = (metric_text(result_trace_average(result, field)) if field else '-' for field in fields)
         valid = f'{"OK" if result["valid"] else "X"} {result["completed"]}/{CONCURRENCY}'
         tier = result['source'] if len(result['source']) <= 5 else 'MIXED'
         evidence = f'{result["stage"].split("-", 1)[0]} {result["source"]}; {result_evidence(result)}'[:36]
-        print(f'| {result["stage"].split("-", 1)[0]:<5} | {tier:<5} | {ttft:>7} | {hbm_lookup:>6} | {dram_lookup:>7} | {dram_move:>7} | {valid:<5} | {evidence:<36} |')
+        print(f'| {result["stage"].split("-", 1)[0]:<5} | {tier:<5} | {ttft:>7} | {lookup:>6} | {read:>7} | {move:>7} | {valid:<5} | {evidence:<36} |')
     print('+-------+-------+---------+--------+---------+---------+-------+--------------------------------------+')
 
 try:
