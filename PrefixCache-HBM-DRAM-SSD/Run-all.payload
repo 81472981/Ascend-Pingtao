@@ -13,7 +13,6 @@ if [[ -z "${VB_RUN_DIR:-}" ]]; then
   done
 fi
 export VB_RUN_DIR
-export VB_EXPECT_CONCURRENCIES="${VB_EXPECT_CONCURRENCIES:-1,5,10,100}"
 
 cleanup_started_runtime() {
   run_status=$?
@@ -82,7 +81,7 @@ PY
 trap cleanup_started_runtime EXIT INT TERM
 
 echo "Results from all stages will be written to: $VB_RUN_DIR"
-echo "Self-contained execution: C1 -> C5 -> C10 -> C100"
+echo "Self-contained execution: C1 -> C5 -> C10"
 echo "每组流程：R1冷读 -> R2 HBM -> R3 DRAM -> 自动保留SSD重启 -> R4 SSD"
 
 run_concurrency() {
@@ -123,7 +122,7 @@ STORE_TIMEOUT_SECONDS = float(os.environ.get('VB_STORE_TIMEOUT_SECONDS', '300'))
 RUNTIME_RESTART_TIMEOUT_SECONDS = float(os.environ.get('VB_RUNTIME_RESTART_TIMEOUT_SECONDS', '1800'))
 STRICT = os.environ.get('VB_STRICT', '1').lower() not in ('0', 'false', 'no')
 NEW_SESSION = os.environ.get('VB_NEW_SESSION', '0').lower() in ('1', 'true', 'yes')
-EXPECTED_CONCURRENCIES = [int(value) for value in os.environ.get('VB_EXPECT_CONCURRENCIES', '1,5,10,100').split(',') if value.strip()]
+EXPECTED_CONCURRENCIES = [int(value) for value in os.environ.get('VB_EXPECT_CONCURRENCIES', '1,5,10').split(',') if value.strip()]
 VLLM_BIN = os.environ.get('VLLM_BIN', 'vllm')
 MODEL = os.environ.get('VB_MODEL') or None
 SERVED_MODEL_NAME = os.environ.get('VB_SERVED_MODEL_NAME') or None
@@ -1305,7 +1304,8 @@ if invalid_batches:
 PY
 }
 
-VB_RUN_CONCURRENCIES="${VB_RUN_CONCURRENCIES:-1,5,10,100}"
+VB_RUN_CONCURRENCIES="${VB_RUN_CONCURRENCIES:-1,5,10}"
+export VB_EXPECT_CONCURRENCIES="${VB_EXPECT_CONCURRENCIES:-$VB_RUN_CONCURRENCIES}"
 case ",$VB_RUN_CONCURRENCIES," in
   *,1,*|*,5,*|*,10,*|*,100,*) ;;
   *) echo "错误：VB_RUN_CONCURRENCIES 必须包含 1、5、10 或 100"; exit 1 ;;

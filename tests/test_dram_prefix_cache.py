@@ -542,12 +542,12 @@ class DramPrefixCacheTest(unittest.TestCase):
                 result_dir = result_roots[0]
                 self.assertEqual(
                     {path.name for path in result_dir.glob("C*-result.json")},
-                    {"C1-result.json", "C5-result.json", "C10-result.json", "C100-result.json"},
+                    {"C1-result.json", "C5-result.json", "C10-result.json"},
                 )
                 session = json.loads(
                     (result_dir / "session.json").read_text(encoding="utf-8")
                 )
-                self.assertEqual(session["completed_concurrencies"], [1, 5, 10, 100])
+                self.assertEqual(session["completed_concurrencies"], [1, 5, 10])
                 self.assertEqual(session["storage_tiers"], ["HBM", "DRAM", "SSD"])
                 self.assertEqual(session["ssd_transition"]["mode"], "signal-request-v1")
                 runtime_status = dict(
@@ -556,7 +556,7 @@ class DramPrefixCacheTest(unittest.TestCase):
                     if "=" in line
                 )
                 self.assertEqual(runtime_status["state"], "ready")
-                self.assertEqual(runtime_status["generation"], "5")
+                self.assertEqual(runtime_status["generation"], "4")
 
                 c1_payload = json.loads(
                     (result_dir / "C1-result.json").read_text(encoding="utf-8")
@@ -574,10 +574,10 @@ class DramPrefixCacheTest(unittest.TestCase):
                     (result_dir / "p1-manifest.json").read_text(encoding="utf-8")
                 )
                 requests = list(manifest["requests"].values())
-                self.assertEqual(len(requests), 116)
-                self.assertEqual(len({row["prompt_sha256"] for row in requests}), 116)
+                self.assertEqual(len(requests), 16)
+                self.assertEqual(len({row["prompt_sha256"] for row in requests}), 16)
                 self.assertEqual(
-                    len({row["first_block_sha256"] for row in requests}), 116
+                    len({row["first_block_sha256"] for row in requests}), 16
                 )
 
                 workbook = result_dir / "vb-result.xlsx"
@@ -595,14 +595,14 @@ class DramPrefixCacheTest(unittest.TestCase):
                 if openpyxl is not None:
                     loaded = openpyxl.load_workbook(workbook, read_only=True)
                     summary = loaded["Summary"]
-                    self.assertEqual(summary.max_row, 5)
+                    self.assertEqual(summary.max_row, 4)
                     self.assertEqual(
-                        [summary.cell(row=row, column=1).value for row in range(2, 6)],
-                        ["C1", "C5", "C10", "C100"],
+                        [summary.cell(row=row, column=1).value for row in range(2, 5)],
+                        ["C1", "C5", "C10"],
                     )
                     self.assertEqual(
-                        [summary.cell(row=row, column=12).value for row in range(2, 6)],
-                        ["4/4", "20/20", "40/40", "400/400"],
+                        [summary.cell(row=row, column=12).value for row in range(2, 5)],
+                        ["4/4", "20/20", "40/40"],
                     )
                     loaded.close()
         finally:
