@@ -523,7 +523,7 @@ class DramPrefixCacheTest(unittest.TestCase):
                     0,
                     msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
                 )
-                self.assertIn("SSD副本 | 新增", completed.stdout)
+                self.assertIn("SSD写盘 | 新增", completed.stdout)
                 self.assertNotIn("not stable", completed.stderr)
 
                 result_roots = list((root / "vb-result").iterdir())

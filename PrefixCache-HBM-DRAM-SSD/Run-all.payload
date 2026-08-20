@@ -563,7 +563,7 @@ def wait_ssd_replicas(ssd_bytes_before):
         now = time.monotonic()
         if now - last_progress >= 10:
             added = max(0, (current or 0) - ssd_bytes_before)
-            print(f'  SSD副本等待 | 已新增{size_text(added)}，等待稳定')
+            print(f'  SSD写盘 | 已写入{size_text(added)}，等待完成')
             last_progress = now
         last = current
         time.sleep(0.5)
@@ -1243,7 +1243,7 @@ try:
         r1['valid'] = r1['valid'] and r1['identity_valid']
         if not r1['identity_valid']:
             r1['reason'] += '; manifest hash mismatch'
-        print('  R1请求完成 | 等待SSD副本稳定')
+        print('  R1请求完成 | 等待SSD写盘完成')
         keys_after_r1, dram_bytes_after = wait_mooncake_settle(keys_before)
         if dram_bytes_after is None or dram_bytes_after <= dram_bytes_before:
             raise RuntimeError(
@@ -1253,7 +1253,7 @@ try:
         ssd_bytes_after = wait_ssd_replicas(ssd_bytes_before)
         batch_ssd_replica_bytes = int(ssd_bytes_after - ssd_bytes_before)
         required_ssd_read_bytes = batch_ssd_replica_bytes
-        print(f'  SSD副本 | 新增{size_text(batch_ssd_replica_bytes)} | OK')
+        print(f'  SSD写盘 | 新增{size_text(batch_ssd_replica_bytes)} | OK')
         r1['reset_evidence'] += (
             f'; Mooncake stable Keys {keys_before} -> {keys_after_r1}; '
             f'DRAM batch bytes={batch_dram_bytes}; stable SSD allocated bytes '
